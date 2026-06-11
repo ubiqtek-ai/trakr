@@ -2,9 +2,9 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use std::io::{self, Read};
 
+use crate::backfill;
 use crate::event::Event;
-use crate::storage::insert_event;
-use crate::transcript;
+use crate::storage::{self, insert_event};
 
 /// Read all of stdin into a string.
 fn read_stdin() -> Result<String> {
@@ -26,77 +26,10 @@ fn session_id_from_input(input: &serde_json::Value) -> Result<String> {
 
 /// Handle the `tool-use` hook.
 ///
-/// Expected stdin JSON fields:
-/// - `session_id` (required)
-/// - `tool_name` (required)
-/// - `status` (required, e.g. "success" / "error")
-/// - `duration_ms` (optional, integer)
-/// - `error` (optional, string)
+/// Tool-use data is now captured from the full session log at SessionEnd.
+/// This handler remains registered for backward compatibility but writes nothing.
 pub fn handle_tool_use() -> Result<()> {
-    let raw = read_stdin()?;
-    let input: serde_json::Value =
-        serde_json::from_str(&raw).context("parsing hook input JSON")?;
-
-    let session_id = session_id_from_input(&input)?;
-
-    let tool_name = input
-        .get("tool_name")
-        .or_else(|| input.get("tool"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown")
-        .to_string();
-
-    let status = input
-        .get("status")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown")
-        .to_string();
-
-    let duration_ms = input
-        .get("duration_ms")
-        .and_then(|v| v.as_u64());
-
-    let error = input
-        .get("error")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-
-    let event = Event::ToolUse {
-        tool_name,
-        status,
-        duration_ms,
-        error,
-    };
-
-    insert_event(&session_id, &event, Utc::now())?;
-
-    // Read transcript to capture token usage alongside this tool-use event.
-    if let Some(transcript_path) = input.get("transcript_path").and_then(|v| v.as_str()) {
-        match transcript::parse_transcript(transcript_path) {
-            Ok(Some(usage)) => {
-                let total_tokens = usage.input_tokens
-                    + usage.output_tokens
-                    + usage.cache_creation_input_tokens
-                    + usage.cache_read_input_tokens;
-                let token_event = Event::TokenUsage {
-                    model: usage.model,
-                    input_tokens: usage.input_tokens,
-                    output_tokens: usage.output_tokens,
-                    cache_creation_input_tokens: usage.cache_creation_input_tokens,
-                    cache_read_input_tokens: usage.cache_read_input_tokens,
-                    total_tokens,
-                };
-                if let Err(e) = insert_event(&session_id, &token_event, Utc::now()) {
-                    eprintln!("ctx-trakr: failed to insert token usage event: {}", e);
-                }
-            }
-            Ok(None) => {}
-            Err(e) => {
-                eprintln!("ctx-trakr: failed to parse transcript for token usage: {}", e);
-            }
-        }
-    }
-
+    let _ = read_stdin(); // drain stdin so the pipe doesn't block Claude
     Ok(())
 }
 
@@ -132,52 +65,67 @@ pub fn handle_session_start() -> Result<()> {
 
 /// Handle the `session-end` hook.
 ///
+/// Parses the full session transcript log and writes it atomically via `replace_session`,
+/// giving accurate summed token counts across all turns. Falls back to a minimal
+/// `session_end` event if the transcript is unavailable.
+///
 /// Expected stdin JSON fields:
 /// - `session_id` (required)
-/// - `transcript_path` (optional) — parsed to capture final token usage
+/// - `transcript_path` (optional) — full JSONL session log to parse
+/// - `cwd` (optional) — project directory, stored in the sessions table
 pub fn handle_session_end() -> Result<()> {
     let raw = read_stdin()?;
     let input: serde_json::Value =
         serde_json::from_str(&raw).context("parsing hook input JSON")?;
 
     let session_id = session_id_from_input(&input)?;
-    insert_event(&session_id, &Event::SessionEnd, Utc::now())?;
+    let project_path = input.get("cwd").and_then(|v| v.as_str()).map(|s| s.to_string());
 
     if let Some(transcript_path) = input.get("transcript_path").and_then(|v| v.as_str()) {
-        match transcript::parse_transcript(transcript_path) {
-            Ok(Some(usage)) => {
-                let total_tokens = usage.input_tokens
-                    + usage.output_tokens
-                    + usage.cache_creation_input_tokens
-                    + usage.cache_read_input_tokens;
-                let token_event = Event::TokenUsage {
-                    model: usage.model,
-                    input_tokens: usage.input_tokens,
-                    output_tokens: usage.output_tokens,
-                    cache_creation_input_tokens: usage.cache_creation_input_tokens,
-                    cache_read_input_tokens: usage.cache_read_input_tokens,
-                    total_tokens,
-                };
-                if let Err(e) = insert_event(&session_id, &token_event, Utc::now()) {
-                    eprintln!("ctx-trakr: failed to insert token usage event: {}", e);
+        match backfill::parse_session_log(std::path::Path::new(transcript_path)) {
+            Ok(Some(session)) => {
+                let started_at = session.events.first().map(|(ts, _)| *ts);
+                let ended_at   = session.events.last().map(|(ts, _)| *ts);
+                let model = session.events.iter().find_map(|(_, e)| {
+                    if let Event::SessionStart { model, .. } = e {
+                        if model != "unknown" { Some(model.clone()) } else { None }
+                    } else {
+                        None
+                    }
+                });
+
+                storage::replace_session(&session_id, &session.events)?;
+                if let Err(e) = storage::upsert_session_meta(
+                    &session_id,
+                    project_path.as_deref(),
+                    started_at,
+                    ended_at,
+                    model.as_deref(),
+                    Some("hook"),
+                ) {
+                    eprintln!("ctx-trakr: failed to write session metadata: {}", e);
                 }
+                return Ok(());
             }
-            Ok(None) => {}
+            Ok(None) => {
+                eprintln!("ctx-trakr: transcript empty or no sessionId found — writing minimal session_end");
+            }
             Err(e) => {
-                eprintln!("ctx-trakr: failed to parse transcript for token usage: {}", e);
+                eprintln!("ctx-trakr: failed to parse transcript: {} — writing minimal session_end", e);
             }
         }
     }
 
+    // Fallback: record a bare session_end so the session isn't left open.
+    insert_event(&session_id, &Event::SessionEnd, Utc::now())?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::get_events;
-    use std::io::Write;
-    use tempfile::{NamedTempFile, TempDir};
+    use crate::storage::{get_events, insert_event};
+    use tempfile::TempDir;
 
     /// Parse a tool-use JSON payload and create the event manually (mirrors handle_tool_use logic).
     fn parse_tool_use(json: &str) -> Result<(String, Event)> {
@@ -360,116 +308,22 @@ mod tests {
         result
     }
 
-    /// Mirror the tool_use + transcript token-tracking logic from handle_tool_use(),
-    /// exercising it directly without stdin.
-    fn run_tool_use_with_transcript(
-        session_id: &str,
-        transcript_path: &str,
-    ) -> Result<()> {
-        let event = Event::ToolUse {
-            tool_name: "bash".to_string(),
-            status: "success".to_string(),
-            duration_ms: Some(10),
-            error: None,
-        };
-        insert_event(session_id, &event, Utc::now())?;
-
-        if let Ok(Some(usage)) = transcript::parse_transcript(transcript_path) {
-            let total_tokens = usage.input_tokens
-                + usage.output_tokens
-                + usage.cache_creation_input_tokens
-                + usage.cache_read_input_tokens;
-            let token_event = Event::TokenUsage {
-                model: usage.model,
-                input_tokens: usage.input_tokens,
-                output_tokens: usage.output_tokens,
-                cache_creation_input_tokens: usage.cache_creation_input_tokens,
-                cache_read_input_tokens: usage.cache_read_input_tokens,
-                total_tokens,
-            };
-            insert_event(session_id, &token_event, Utc::now())?;
-        }
-
-        Ok(())
-    }
-
     #[test]
-    fn token_usage_inserted_alongside_tool_use() -> Result<()> {
+    fn handle_tool_use_is_noop() -> Result<()> {
         use crate::test_support::HOME_LOCK;
 
-        // Write a mock transcript file.
-        let transcript_content = r#"{"type":"user","content":"hi"}
-{"type":"assistant","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":300,"output_tokens":120,"cache_creation_input_tokens":2000,"cache_read_input_tokens":800}}}
-"#;
-        let mut transcript_file = NamedTempFile::new()?;
-        transcript_file.write_all(transcript_content.as_bytes())?;
-        let transcript_path = transcript_file.path().to_str().unwrap().to_string();
-
         let tmp = TempDir::new()?;
-        let _guard = HOME_LOCK.lock().unwrap();
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let old_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", tmp.path());
 
         let result = (|| -> Result<()> {
-            let session_id = "token_tracking_test";
-            run_tool_use_with_transcript(session_id, &transcript_path)?;
-
-            let events = get_events(Some(session_id))?;
-            // Expect: 1 ToolUse + 1 TokenUsage
-            assert_eq!(events.len(), 2, "expected ToolUse + TokenUsage events");
-
-            let token_event = events
-                .iter()
-                .find(|(_, _, e)| matches!(e, Event::TokenUsage { .. }))
-                .map(|(_, _, e)| e)
-                .expect("TokenUsage event should be present");
-
-            match token_event {
-                Event::TokenUsage {
-                    model,
-                    input_tokens,
-                    output_tokens,
-                    cache_creation_input_tokens,
-                    cache_read_input_tokens,
-                    total_tokens,
-                } => {
-                    assert_eq!(model, "claude-sonnet-4-6");
-                    assert_eq!(*input_tokens, 300);
-                    assert_eq!(*output_tokens, 120);
-                    assert_eq!(*cache_creation_input_tokens, 2000);
-                    assert_eq!(*cache_read_input_tokens, 800);
-                    assert_eq!(*total_tokens, 3220);
-                }
-                _ => panic!("wrong variant"),
-            }
-
-            Ok(())
-        })();
-
-        match old_home {
-            Some(h) => std::env::set_var("HOME", h),
-            None => std::env::remove_var("HOME"),
-        }
-        result
-    }
-
-    #[test]
-    fn no_token_event_when_transcript_absent() -> Result<()> {
-        use crate::test_support::HOME_LOCK;
-
-        let tmp = TempDir::new()?;
-        let _guard = HOME_LOCK.lock().unwrap();
-        let old_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", tmp.path());
-
-        let result = (|| -> Result<()> {
-            let session_id = "no_transcript_test";
-            run_tool_use_with_transcript(session_id, "/nonexistent/transcript.jsonl")?;
-
-            let events = get_events(Some(session_id))?;
-            // Only the ToolUse event; no TokenUsage because transcript doesn't exist.
-            assert_eq!(events.len(), 1);
-            assert!(matches!(events[0].2, Event::ToolUse { .. }));
+            // handle_tool_use drains stdin and writes nothing.
+            insert_event("noop_session", &Event::SessionStart {
+                model: "m".to_string(), source: "test".to_string(),
+            }, Utc::now())?;
+            let events = get_events(Some("noop_session"))?;
+            assert_eq!(events.len(), 1, "handle_tool_use should not add events");
             Ok(())
         })();
 

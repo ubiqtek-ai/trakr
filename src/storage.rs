@@ -35,6 +35,8 @@ fn open_db() -> Result<Connection> {
     }
     let conn = Connection::open(&path)
         .with_context(|| format!("opening SQLite db at {}", path.display()))?;
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
+        .context("configuring SQLite pragmas")?;
     Ok(conn)
 }
 
@@ -58,9 +60,17 @@ pub fn init_db() -> Result<()> {
             timestamp  TEXT    NOT NULL,
             event_type TEXT    NOT NULL,
             payload    TEXT    NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS sessions (
+            session_id   TEXT PRIMARY KEY,
+            project_path TEXT,
+            started_at   TEXT,
+            ended_at     TEXT,
+            model        TEXT,
+            source       TEXT
         );",
     )
-    .context("creating events table")?;
+    .context("creating tables")?;
 
     Ok(())
 }
@@ -153,6 +163,224 @@ pub fn get_events(session_id: Option<&str>) -> Result<Vec<(String, DateTime<Utc>
     Ok(results)
 }
 
+/// Returns the set of session IDs that have a `session_start` event recorded.
+pub fn get_started_session_ids() -> Result<std::collections::HashSet<String>> {
+    let conn = open_db()?;
+    let mut stmt = conn
+        .prepare("SELECT DISTINCT session_id FROM events WHERE event_type = 'session_start'")
+        .context("preparing started sessions query")?;
+    let ids = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .context("querying started sessions")?
+        .collect::<Result<std::collections::HashSet<_>, _>>()
+        .context("reading started session ids")?;
+    Ok(ids)
+}
+
+/// Returns the set of session IDs that have a `session_end` event recorded.
+pub fn get_completed_session_ids() -> Result<std::collections::HashSet<String>> {
+    let conn = open_db()?;
+    let mut stmt = conn
+        .prepare("SELECT DISTINCT session_id FROM events WHERE event_type = 'session_end'")
+        .context("preparing completed sessions query")?;
+    let ids = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .context("querying completed sessions")?
+        .collect::<Result<std::collections::HashSet<_>, _>>()
+        .context("reading completed session ids")?;
+    Ok(ids)
+}
+
+/// Compute the total estimated spend in USD for sessions that ended in the given year-month.
+///
+/// Uses the LAST `token_usage` event per session (cumulative counts — not a sum of all events).
+/// Returns `(total_usd, session_count)`.
+pub fn get_monthly_spend_usd(year_month: &str) -> Result<(f64, usize)> {
+    use crate::cost::compute_cost_usd;
+
+    let conn = open_db()?;
+
+    // Find sessions that ended this month.
+    let completed_this_month: Vec<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT session_id FROM events \
+             WHERE event_type = 'session_end' \
+               AND strftime('%Y-%m', timestamp) = ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![year_month], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()
+            .context("reading completed sessions this month")?;
+        rows
+    };
+
+    if completed_this_month.is_empty() {
+        return Ok((0.0, 0));
+    }
+
+    let mut total_usd = 0.0;
+
+    for session_id in &completed_this_month {
+        // Get the last token_usage payload for this session.
+        let payload: Option<String> = conn
+            .query_row(
+                "SELECT payload FROM events \
+                 WHERE session_id = ?1 AND event_type = 'token_usage' \
+                 ORDER BY id DESC LIMIT 1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .ok();
+
+        let Some(payload) = payload else { continue };
+
+        let Ok(event) = serde_json::from_str::<crate::event::Event>(&payload) else { continue };
+
+        if let crate::event::Event::TokenUsage {
+            model,
+            input_tokens,
+            output_tokens,
+            cache_creation_input_tokens,
+            cache_read_input_tokens,
+            ..
+        } = event
+        {
+            total_usd += compute_cost_usd(
+                &model,
+                input_tokens,
+                output_tokens,
+                cache_creation_input_tokens,
+                cache_read_input_tokens,
+            );
+        }
+    }
+
+    Ok((total_usd, completed_this_month.len()))
+}
+
+/// Upsert project/timing/model metadata for a session into the `sessions` table.
+///
+/// Uses COALESCE so partial updates don't overwrite existing values with NULL.
+pub fn upsert_session_meta(
+    session_id: &str,
+    project_path: Option<&str>,
+    started_at: Option<DateTime<Utc>>,
+    ended_at: Option<DateTime<Utc>>,
+    model: Option<&str>,
+    source: Option<&str>,
+) -> Result<()> {
+    let conn = open_db()?;
+    conn.execute(
+        "INSERT INTO sessions (session_id, project_path, started_at, ended_at, model, source)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(session_id) DO UPDATE SET
+             project_path = COALESCE(excluded.project_path, sessions.project_path),
+             started_at   = COALESCE(excluded.started_at,   sessions.started_at),
+             ended_at     = COALESCE(excluded.ended_at,     sessions.ended_at),
+             model        = COALESCE(excluded.model,        sessions.model),
+             source       = COALESCE(excluded.source,       sessions.source)",
+        params![
+            session_id,
+            project_path,
+            started_at.map(|t| t.to_rfc3339()),
+            ended_at.map(|t| t.to_rfc3339()),
+            model,
+            source,
+        ],
+    )
+    .context("upserting session metadata")?;
+    Ok(())
+}
+
+/// Returns (earliest_timestamp, latest_timestamp, total_session_count) from the DB.
+/// Returns Ok(None) if the DB is empty or does not exist yet.
+pub fn get_db_summary() -> Result<Option<(DateTime<Utc>, DateTime<Utc>, usize)>> {
+    let path = db_path()?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let conn = open_db()?;
+    let row: Option<(String, String, usize)> = conn
+        .query_row(
+            "SELECT MIN(timestamp), MAX(timestamp), COUNT(DISTINCT session_id) FROM events",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .ok();
+    let Some((min_ts, max_ts, count)) = row else {
+        return Ok(None);
+    };
+    if count == 0 {
+        return Ok(None);
+    }
+    let earliest = DateTime::parse_from_rfc3339(&min_ts)
+        .context("parsing earliest timestamp")?
+        .with_timezone(&Utc);
+    let latest = DateTime::parse_from_rfc3339(&max_ts)
+        .context("parsing latest timestamp")?
+        .with_timezone(&Utc);
+    Ok(Some((earliest, latest, count)))
+}
+
+/// Atomically replace all events for a session with a new set.
+///
+/// Deletes existing rows and inserts the new events in a single transaction, so a crash cannot
+/// leave the session in a half-written state. Also removes the JSONL backup file (best-effort).
+pub fn replace_session(
+    session_id: &str,
+    events: &[(chrono::DateTime<Utc>, crate::event::Event)],
+) -> Result<()> {
+    let path = db_path()?;
+    let conn = Connection::open(&path)
+        .with_context(|| format!("opening SQLite db at {}", path.display()))?;
+
+    conn.execute_batch("BEGIN;")?;
+
+    conn.execute("DELETE FROM events WHERE session_id = ?1", params![session_id])
+        .context("deleting existing events in transaction")?;
+
+    for (ts, event) in events {
+        let payload = serde_json::to_string(event).context("serialising event")?;
+        let ts_str = ts.to_rfc3339();
+        let event_type = event.event_type_label();
+        conn.execute(
+            "INSERT INTO events (session_id, timestamp, event_type, payload) VALUES (?1, ?2, ?3, ?4)",
+            params![session_id, ts_str, event_type, payload],
+        )
+        .context("inserting event in transaction")?;
+    }
+
+    conn.execute_batch("COMMIT;")?;
+
+    // Best-effort: remove the JSONL backup file if it exists.
+    if let Ok(p) = jsonl_path(session_id) {
+        if p.exists() {
+            let _ = fs::remove_file(&p);
+        }
+    }
+
+    Ok(())
+}
+
+/// Deletes all events for the given session from the DB and removes the JSONL backup if present.
+pub fn delete_events_for_session(session_id: &str) -> Result<()> {
+    let conn = open_db()?;
+    conn.execute(
+        "DELETE FROM events WHERE session_id = ?1",
+        params![session_id],
+    )
+    .context("deleting events for session")?;
+
+    // Best-effort: remove the JSONL backup file if it exists.
+    if let Ok(path) = jsonl_path(session_id) {
+        if path.exists() {
+            let _ = fs::remove_file(&path);
+        }
+    }
+
+    Ok(())
+}
+
 /// Returns a list of all session_ids with their event counts.
 pub fn get_sessions() -> Result<Vec<(String, usize)>> {
     let conn = open_db()?;
@@ -179,7 +407,7 @@ mod tests {
 
     /// Run `f` with $HOME temporarily set to `tmp`.
     fn with_home<F: FnOnce() -> Result<()>>(tmp: &TempDir, f: F) -> Result<()> {
-        let _guard = HOME_LOCK.lock().unwrap();
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let old_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", tmp.path());
         let result = f();
