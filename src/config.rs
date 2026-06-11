@@ -16,7 +16,7 @@ fn default_budget() -> f64 {
     50.0
 }
 fn default_api_port() -> u16 {
-    8787
+    8788
 }
 fn default_otel_port() -> u16 {
     4318
@@ -61,7 +61,7 @@ pub fn write_default_config() -> Result<()> {
 monthly_budget_usd = 50.0
 
 # Port for the HTTP API server (GET /spend/monthly).
-api_port = 8787
+api_port = 8788
 
 # Port for the OTLP HTTP receiver.
 # Set OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318

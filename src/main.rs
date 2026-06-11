@@ -83,6 +83,16 @@ enum Commands {
         /// Session ID (or unambiguous prefix) to look up
         session_id: String,
     },
+    /// Tail the trakr serve log
+    Logs {
+        /// Number of lines to show initially (default 50)
+        #[arg(short = 'n', default_value = "50")]
+        lines: usize,
+    },
+    /// Install trakr serve as a macOS LaunchAgent (starts on login)
+    InstallService,
+    /// Remove the trakr LaunchAgent
+    UninstallService,
 }
 
 fn main() {
@@ -112,6 +122,9 @@ fn run(cli: Cli) -> Result<()> {
             cmd_inspect_logs(project.as_deref(), since.as_deref(), verbose)
         }
         Commands::ShowPrompts { session_id } => cmd_show_prompts(&session_id),
+        Commands::Logs { lines } => cmd_logs(lines),
+        Commands::InstallService => cmd_install_service(),
+        Commands::UninstallService => cmd_uninstall_service(),
     }
 }
 
@@ -174,15 +187,33 @@ fn cmd_init() -> Result<()> {
     println!("trakr: config:             {}", base.join("config.toml").display());
 
     match write_hooks_to_settings() {
-        Ok(()) => println!("ctx-trakr: hooks written to   ~/.claude/settings.json"),
+        Ok(()) => println!("trakr: hooks written to    ~/.claude/settings.json"),
         Err(e) => {
-            println!("ctx-trakr: could not write hooks automatically: {}", e);
+            println!("trakr: could not write hooks automatically: {}", e);
             println!();
             println!("Add the following to ~/.claude/settings.json under \"hooks\" manually:");
             println!();
             println!("{}", suggested_hook_config());
         }
     }
+
+    println!();
+    println!("── OTEL live cost tracking (optional) ──────────────────────────");
+    println!("To enable live spend tracking during active sessions, add these");
+    println!("environment variables to your shell profile (~/.zshrc etc.):");
+    println!();
+    println!("  export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318");
+    println!("  export OTEL_EXPORTER_OTLP_PROTOCOL=http/json");
+    println!();
+    println!("Then run the receiver (or install it as a background service):");
+    println!();
+    println!("  trakr serve               # foreground");
+    println!("  trakr install-service     # start on login via launchd");
+    println!();
+    println!("Safe to configure without the server running — Claude will");
+    println!("silently skip export if trakr serve is not active. Session");
+    println!("costs are always captured at session end via transcript parse.");
+    println!("────────────────────────────────────────────────────────────────");
 
     Ok(())
 }
@@ -985,15 +1016,71 @@ fn cmd_spend() -> Result<()> {
 
     let cfg = config::load_config()?;
     let year_month = Utc::now().format("%Y-%m").to_string();
-    let (spent, count) = storage::get_monthly_spend_usd(&year_month)?;
 
-    println!(
-        "${:.2} / ${:.2}  ({} completed session(s) in {})",
-        spent, cfg.monthly_budget_usd, count, year_month
-    );
-    println!("(SQLite only — start `trakr serve` for live active-session data)");
+    // Try the live API first; fall back to SQLite if the server isn't running.
+    let api_url = format!("http://127.0.0.1:{}/spend/monthly", cfg.api_port);
+    if let Some(body) = try_get(&api_url) {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
+            let total    = json.get("spent_estimated_usd").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let budget   = json.get("budget_usd").and_then(|v| v.as_f64()).unwrap_or(cfg.monthly_budget_usd);
+            let period   = json.get("period").and_then(|v| v.as_str()).unwrap_or(&year_month);
+            let sources  = json.get("sources");
+            let completed_usd   = sources.and_then(|s| s.get("completed_sessions_usd")).and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let completed_count = sources.and_then(|s| s.get("completed_sessions_count")).and_then(|v| v.as_u64()).unwrap_or(0);
+            let active_usd      = sources.and_then(|s| s.get("active_sessions_usd")).and_then(|v| v.as_f64()).unwrap_or(0.0);
+
+            println!("Spend  {}  (budget ${:.2})", period, budget);
+            println!("{}", "-".repeat(42));
+            println!("  {:<30} ${:>8.2}", format!("Completed sessions ({})", completed_count), completed_usd);
+            if active_usd > 0.0 {
+                println!("  {:<30} ${:>8.2}", "Active session (live)", active_usd);
+            }
+            println!("{}", "-".repeat(42));
+            println!("  {:<30} ${:>8.2}", "Total", total);
+            return Ok(());
+        }
+    }
+
+    // Server not reachable — use SQLite.
+    let (spent, count) = storage::get_monthly_spend_usd(&year_month)?;
+    println!("Spend  {}  (budget ${:.2})", year_month, cfg.monthly_budget_usd);
+    println!("{}", "-".repeat(42));
+    println!("  {:<30} ${:>8.2}", format!("Completed sessions ({})", count), spent);
+    println!("{}", "-".repeat(42));
+    println!("  {:<30} ${:>8.2}", "Total", spent);
+    println!("(trakr serve not running — active session costs not included)");
 
     Ok(())
+}
+
+/// Attempt a blocking HTTP GET; returns the body on 200, None otherwise.
+fn try_get(url: &str) -> Option<String> {
+    use std::io::Read;
+    use std::net::TcpStream;
+
+    let addr = url
+        .trim_start_matches("http://")
+        .split('/')
+        .next()?;
+
+    let path = url.trim_start_matches("http://").trim_start_matches(addr);
+
+    let mut stream = TcpStream::connect(addr).ok()?;
+    stream.set_read_timeout(Some(std::time::Duration::from_millis(500))).ok()?;
+
+    let request = format!("GET {} HTTP/1.0\r\nHost: {}\r\n\r\n", path, addr);
+    std::io::Write::write_all(&mut stream, request.as_bytes()).ok()?;
+
+    let mut response = String::new();
+    stream.read_to_string(&mut response).ok()?;
+
+    // Split headers from body.
+    let body = response.split("\r\n\r\n").nth(1)?;
+    if response.starts_with("HTTP/1") && response.contains(" 200 ") {
+        Some(body.to_string())
+    } else {
+        None
+    }
 }
 
 fn cmd_show_prompts(session_id: &str) -> Result<()> {
@@ -1082,6 +1169,112 @@ fn cmd_show_prompts(session_id: &str) -> Result<()> {
     println!("[{}]  ── last entry ──", last_ts);
     println!("{}", "-".repeat(60));
     println!("{} prompt(s)", count);
+    Ok(())
+}
+
+fn cmd_logs(lines: usize) -> Result<()> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
+    let log_path = home.join(".trakr").join("serve.log");
+
+    if !log_path.exists() {
+        println!("No log file found at {} — is trakr serve running?", log_path.display());
+        return Ok(());
+    }
+
+    let status = std::process::Command::new("tail")
+        .args(["-n", &lines.to_string(), "-f", log_path.to_str().unwrap()])
+        .status()
+        .context("running tail")?;
+
+    if !status.success() {
+        anyhow::bail!("tail exited with status {}", status);
+    }
+
+    Ok(())
+}
+
+const LAUNCH_AGENT_LABEL: &str = "com.trakr.serve";
+
+fn launch_agent_plist_path() -> Result<std::path::PathBuf> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
+    Ok(home.join("Library").join("LaunchAgents").join(format!("{}.plist", LAUNCH_AGENT_LABEL)))
+}
+
+fn cmd_install_service() -> Result<()> {
+    let binary = std::env::current_exe().context("cannot determine trakr binary path")?;
+    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
+    let log_path = home.join(".trakr").join("serve.log");
+    let plist_path = launch_agent_plist_path()?;
+
+    if let Some(parent) = plist_path.parent() {
+        std::fs::create_dir_all(parent).context("creating LaunchAgents directory")?;
+    }
+
+    let plist = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{binary}</string>
+        <string>serve</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>{log}</string>
+    <key>StandardErrorPath</key>
+    <string>{log}</string>
+</dict>
+</plist>
+"#,
+        label = LAUNCH_AGENT_LABEL,
+        binary = binary.display(),
+        log = log_path.display(),
+    );
+
+    std::fs::write(&plist_path, &plist)
+        .with_context(|| format!("writing plist to {}", plist_path.display()))?;
+
+    let status = std::process::Command::new("launchctl")
+        .args(["load", plist_path.to_str().unwrap()])
+        .status()
+        .context("running launchctl load")?;
+
+    if !status.success() {
+        anyhow::bail!("launchctl load failed — plist written to {}", plist_path.display());
+    }
+
+    println!("trakr: service installed and started");
+    println!("trakr: plist:  {}", plist_path.display());
+    println!("trakr: log:    {}", log_path.display());
+    println!("trakr: runs automatically on login");
+
+    Ok(())
+}
+
+fn cmd_uninstall_service() -> Result<()> {
+    let plist_path = launch_agent_plist_path()?;
+
+    if !plist_path.exists() {
+        println!("trakr: no service installed (plist not found at {})", plist_path.display());
+        return Ok(());
+    }
+
+    let _ = std::process::Command::new("launchctl")
+        .args(["unload", plist_path.to_str().unwrap()])
+        .status();
+
+    std::fs::remove_file(&plist_path)
+        .with_context(|| format!("removing plist at {}", plist_path.display()))?;
+
+    println!("trakr: service stopped and removed");
+
     Ok(())
 }
 
