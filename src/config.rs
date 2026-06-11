@@ -34,10 +34,10 @@ impl Default for Config {
 
 pub fn config_path() -> Result<PathBuf> {
     let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("no home directory"))?;
-    Ok(home.join(".ctx-trakr").join("config.toml"))
+    Ok(home.join(".trakr").join("config.toml"))
 }
 
-/// Load config from `~/.ctx-trakr/config.toml`, returning defaults if the file doesn't exist.
+/// Load config from `~/.trakr/config.toml`, returning defaults if the file doesn't exist.
 pub fn load_config() -> Result<Config> {
     let path = config_path()?;
     if !path.exists() {
@@ -107,7 +107,7 @@ mod tests {
     #[test]
     fn loads_custom_budget() {
         let tmp = TempDir::new().unwrap();
-        let base = tmp.path().join(".ctx-trakr");
+        let base = tmp.path().join(".trakr");
         fs::create_dir_all(&base).unwrap();
         fs::write(base.join("config.toml"), "monthly_budget_usd = 100.0\n").unwrap();
 
@@ -123,7 +123,7 @@ mod tests {
     #[test]
     fn write_default_config_creates_file() {
         let tmp = TempDir::new().unwrap();
-        let base = tmp.path().join(".ctx-trakr");
+        let base = tmp.path().join(".trakr");
         fs::create_dir_all(&base).unwrap();
 
         with_home(&tmp, || {

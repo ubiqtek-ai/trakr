@@ -7,23 +7,23 @@ use std::path::PathBuf;
 
 use crate::event::Event;
 
-/// Returns `~/.ctx-trakr/`.
+/// Returns `~/.trakr/`.
 fn base_dir() -> Result<PathBuf> {
     let home = dirs::home_dir().context("cannot determine home directory")?;
-    Ok(home.join(".ctx-trakr"))
+    Ok(home.join(".trakr"))
 }
 
-/// Returns the path to the unified DB: `~/.ctx-trakr/ctx-trakr.db`.
+/// Returns the path to the unified DB: `~/.trakr/trakr.db`.
 fn db_path() -> Result<PathBuf> {
-    Ok(base_dir()?.join("ctx-trakr.db"))
+    Ok(base_dir()?.join("trakr.db"))
 }
 
-/// Returns the sessions directory: `~/.ctx-trakr/sessions/`.
+/// Returns the sessions directory: `~/.trakr/sessions/`.
 fn sessions_dir() -> Result<PathBuf> {
     Ok(base_dir()?.join("sessions"))
 }
 
-/// Returns the transcripts directory: `~/.ctx-trakr/transcripts/`.
+/// Returns the transcripts directory: `~/.trakr/transcripts/`.
 fn transcripts_dir() -> Result<PathBuf> {
     Ok(base_dir()?.join("transcripts"))
 }
@@ -32,7 +32,7 @@ fn jsonl_path(session_id: &str) -> Result<PathBuf> {
     Ok(sessions_dir()?.join(format!("{}.jsonl", session_id)))
 }
 
-/// Copy a Claude native session JSONL to `~/.ctx-trakr/transcripts/<session_id>.jsonl`.
+/// Copy a Claude native session JSONL to `~/.trakr/transcripts/<session_id>.jsonl`.
 ///
 /// No-ops silently if `source_path` does not exist (best-effort; hook path may race).
 pub fn archive_transcript(session_id: &str, source_path: &std::path::Path) -> Result<()> {
@@ -61,7 +61,7 @@ fn open_db() -> Result<Connection> {
     Ok(conn)
 }
 
-/// Create `~/.ctx-trakr/ctx-trakr.db` with the unified events table if it doesn't already exist.
+/// Create `~/.trakr/trakr.db` with the unified events table if it doesn't already exist.
 /// Only needs to be called once at startup.
 pub fn init_db() -> Result<()> {
     let dir = base_dir()?;
@@ -571,7 +571,7 @@ mod tests {
             let session_id = "test_session_jsonl";
             insert_event(session_id, &Event::SessionEnd, Utc::now())?;
             let jsonl = tmp_path
-                .join(".ctx-trakr")
+                .join(".trakr")
                 .join("sessions")
                 .join(format!("{}.jsonl", session_id));
             assert!(jsonl.exists(), "JSONL file should exist");
@@ -639,7 +639,7 @@ mod tests {
         let tmp_path = tmp.path().to_path_buf();
         with_home(&tmp, || {
             insert_event("any_session", &Event::SessionEnd, Utc::now())?;
-            let expected_db = tmp_path.join(".ctx-trakr").join("ctx-trakr.db");
+            let expected_db = tmp_path.join(".trakr").join("trakr.db");
             assert!(expected_db.exists(), "unified DB should exist at {:?}", expected_db);
             Ok(())
         })

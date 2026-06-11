@@ -24,7 +24,7 @@ enum Commands {
         /// Hook event type: tool-use | session-start | session-end
         event_type: String,
     },
-    /// Set up ~/.ctx-trakr/ and register hooks in Claude Code settings
+    /// Set up ~/.trakr/ and register hooks in Claude Code settings
     Init,
     /// List recorded sessions from the unified DB
     List,
@@ -89,7 +89,7 @@ fn main() {
     let cli = Cli::parse();
     // Hook handlers must never block Claude — always exit 0.
     if let Err(e) = run(cli) {
-        eprintln!("ctx-trakr error: {:#}", e);
+        eprintln!("trakr error: {:#}", e);
     }
     std::process::exit(0);
 }
@@ -158,7 +158,7 @@ fn cmd_init() -> Result<()> {
     let home = dirs::home_dir()
         .ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
 
-    let base = home.join(".ctx-trakr");
+    let base = home.join(".trakr");
     let sessions = base.join("sessions");
     let transcripts = base.join("transcripts");
     fs::create_dir_all(&sessions)?;
@@ -168,7 +168,7 @@ fn cmd_init() -> Result<()> {
     ctx_trakr::config::write_default_config()?;
 
     println!("trakr: initialised {}", base.display());
-    println!("trakr: unified DB:         {}", base.join("ctx-trakr.db").display());
+    println!("trakr: unified DB:         {}", base.join("trakr.db").display());
     println!("trakr: sessions directory: {}", sessions.display());
     println!("trakr: transcripts:        {}", transcripts.display());
     println!("trakr: config:             {}", base.join("config.toml").display());
@@ -283,7 +283,7 @@ fn cmd_reset(yes: bool) -> Result<()> {
 
     let home = dirs::home_dir()
         .ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
-    let base = home.join(".ctx-trakr");
+    let base = home.join(".trakr");
 
     if !base.exists() {
         println!("Nothing to reset — {} does not exist.", base.display());
@@ -302,7 +302,7 @@ fn cmd_reset(yes: bool) -> Result<()> {
     }
 
     // Clear the DB contents but keep the file and schema.
-    let db = base.join("ctx-trakr.db");
+    let db = base.join("trakr.db");
     if db.exists() {
         let conn = rusqlite::Connection::open(&db)
             .with_context(|| format!("opening DB at {}", db.display()))?;
@@ -340,7 +340,7 @@ fn cmd_list() -> Result<()> {
     let sessions = storage::get_sessions()?;
 
     if sessions.is_empty() {
-        println!("No sessions recorded yet. Run `ctx-trakr hook session-start` or `ctx-trakr migrate`.");
+        println!("No sessions recorded yet. Run `trakr hook session-start` or `trakr migrate`.");
         return Ok(());
     }
 
@@ -364,7 +364,7 @@ fn cmd_migrate() -> Result<()> {
 
     let home = dirs::home_dir()
         .ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
-    let sessions_dir = home.join(".ctx-trakr").join("sessions");
+    let sessions_dir = home.join(".trakr").join("sessions");
 
     if !sessions_dir.exists() {
         println!("No sessions directory found at {}. Nothing to migrate.", sessions_dir.display());
@@ -478,7 +478,7 @@ fn cmd_migrate() -> Result<()> {
             let already_exists = {
                 // We need a raw connection to run a check query; reuse storage's open path via a
                 // small helper. Since storage doesn't expose the connection, open it directly here.
-                let db_path = home.join(".ctx-trakr").join("ctx-trakr.db");
+                let db_path = home.join(".trakr").join("trakr.db");
                 let conn = rusqlite::Connection::open(&db_path)
                     .with_context(|| format!("opening DB at {}", db_path.display()))?;
                 let count: i64 = conn.query_row(
@@ -634,7 +634,7 @@ fn cmd_stats() -> Result<()> {
         }
     }
 
-    println!("ctx-trakr stats");
+    println!("trakr stats");
     println!("{}", "=".repeat(39));
     println!();
     println!("Sessions: {}   Events: {}", total_sessions, total_events);
@@ -852,7 +852,7 @@ fn cmd_inspect_logs(project: Option<&str>, since: Option<&str>, verbose: bool) -
     // ── ctx-trakr DB section ───────────────────────────────────────────────────
 
     println!();
-    println!("ctx-trakr DB  (~/.ctx-trakr/ctx-trakr.db)");
+    println!("ctx-trakr DB  (~/.trakr/trakr.db)");
     println!("{}", "-".repeat(55));
     match storage::get_db_summary()? {
         None => {
@@ -938,7 +938,7 @@ fn run_log_reconciliation() -> Result<()> {
 
     if n_new + n_replaced > 0 {
         eprintln!(
-            "ctx-trakr: reconciled {} new, {} replaced session(s) from logs",
+            "trakr: reconciled {} new, {} replaced session(s) from logs",
             n_new, n_replaced
         );
     }
@@ -959,7 +959,7 @@ fn cmd_serve(api_port_override: Option<u16>, otel_port_override: Option<u16>) ->
 
     // Reconcile any sessions whose SessionEnd hook was missed before starting the server.
     if let Err(e) = run_log_reconciliation() {
-        eprintln!("ctx-trakr: reconciliation warning: {:#}", e);
+        eprintln!("trakr: reconciliation warning: {:#}", e);
     }
 
     let rt = tokio::runtime::Runtime::new().context("creating tokio runtime")?;
@@ -991,7 +991,7 @@ fn cmd_spend() -> Result<()> {
         "${:.2} / ${:.2}  ({} completed session(s) in {})",
         spent, cfg.monthly_budget_usd, count, year_month
     );
-    println!("(SQLite only — start `ctx-trakr serve` for live active-session data)");
+    println!("(SQLite only — start `trakr serve` for live active-session data)");
 
     Ok(())
 }

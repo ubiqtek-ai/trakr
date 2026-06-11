@@ -50,13 +50,13 @@ pub async fn start_server(port: u16, state: AppState) {
     let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("ctx-trakr: API server failed to bind on {}: {}", addr, e);
+            eprintln!("trakr: API server failed to bind on {}: {}", addr, e);
             return;
         }
     };
-    eprintln!("ctx-trakr: API server listening on http://{}", addr);
+    eprintln!("trakr: API server listening on http://{}", addr);
     if let Err(e) = axum::serve(listener, app).await {
-        eprintln!("ctx-trakr: API server error: {}", e);
+        eprintln!("trakr: API server error: {}", e);
     }
 }
 
