@@ -160,15 +160,18 @@ fn cmd_init() -> Result<()> {
 
     let base = home.join(".ctx-trakr");
     let sessions = base.join("sessions");
+    let transcripts = base.join("transcripts");
     fs::create_dir_all(&sessions)?;
+    fs::create_dir_all(&transcripts)?;
 
     storage::init_db()?;
     ctx_trakr::config::write_default_config()?;
 
-    println!("ctx-trakr: initialised {}", base.display());
-    println!("ctx-trakr: unified DB:        {}", base.join("ctx-trakr.db").display());
-    println!("ctx-trakr: sessions directory: {}", sessions.display());
-    println!("ctx-trakr: config:             {}", base.join("config.toml").display());
+    println!("trakr: initialised {}", base.display());
+    println!("trakr: unified DB:         {}", base.join("ctx-trakr.db").display());
+    println!("trakr: sessions directory: {}", sessions.display());
+    println!("trakr: transcripts:        {}", transcripts.display());
+    println!("trakr: config:             {}", base.join("config.toml").display());
 
     match write_hooks_to_settings() {
         Ok(()) => println!("ctx-trakr: hooks written to   ~/.claude/settings.json"),
@@ -192,7 +195,7 @@ fn suggested_hook_config() -> String {
         "hooks": [
           {
             "type": "command",
-            "command": "ctx-trakr hook session-start"
+            "command": "trakr hook session-start"
           }
         ]
       }
@@ -202,7 +205,7 @@ fn suggested_hook_config() -> String {
         "hooks": [
           {
             "type": "command",
-            "command": "ctx-trakr hook session-end"
+            "command": "trakr hook session-end"
           }
         ]
       }
@@ -232,8 +235,8 @@ fn write_hooks_to_settings() -> Result<()> {
     };
 
     let to_install = [
-        ("SessionStart", "ctx-trakr hook session-start"),
-        ("SessionEnd",   "ctx-trakr hook session-end"),
+        ("SessionStart", "trakr hook session-start"),
+        ("SessionEnd",   "trakr hook session-end"),
     ];
 
     {
@@ -318,7 +321,18 @@ fn cmd_reset(yes: bool) -> Result<()> {
         }
     }
 
-    println!("Reset complete — all events cleared.");
+    // Remove archived transcripts but keep the directory.
+    let transcripts = base.join("transcripts");
+    if transcripts.exists() {
+        for entry in fs::read_dir(&transcripts)? {
+            let path = entry?.path();
+            if path.extension().map_or(false, |e| e == "jsonl") {
+                fs::remove_file(&path)?;
+            }
+        }
+    }
+
+    println!("Reset complete — all events and transcripts cleared.");
     Ok(())
 }
 

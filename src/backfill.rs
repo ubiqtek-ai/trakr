@@ -9,7 +9,13 @@ use crate::storage;
 pub struct BackfilledSession {
     pub session_id: String,
     pub project_path: Option<String>,
+    /// The native Claude JSONL file this session was parsed from.
+    pub source_path: PathBuf,
     pub events: Vec<(DateTime<Utc>, Event)>,
+    pub title: Option<String>,
+    /// Compact summary text from `isCompactSummary:true` user messages, truncated to 2000 chars.
+    pub summary: Option<String>,
+    pub last_prompt: Option<String>,
 }
 
 /// Outcome of attempting to backfill a single session.
@@ -68,7 +74,6 @@ pub fn discover_sessions(
             };
             let path = sub.path();
 
-            // Depth 1 only — skip subdirectories.
             if !path.is_file() {
                 continue;
             }
@@ -102,6 +107,35 @@ pub fn discover_sessions(
     Ok(paths)
 }
 
+/// Extract text from a Claude message's `content` field.
+///
+/// Handles both plain-string content and content arrays with `type:"text"` blocks.
+fn extract_content_text(message: &serde_json::Value) -> Option<String> {
+    let content = message.get("content")?;
+    if let Some(s) = content.as_str() {
+        return Some(s.to_string());
+    }
+    if let Some(arr) = content.as_array() {
+        for block in arr {
+            if block.get("type").and_then(|v| v.as_str()) == Some("text") {
+                if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
+                    return Some(text.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Truncate a string to at most `max_chars` Unicode scalar values.
+fn truncate_chars(s: String, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s
+    } else {
+        s.chars().take(max_chars).collect()
+    }
+}
+
 /// Parse a Claude Code native session log and reconstruct a `BackfilledSession`.
 ///
 /// Returns `Ok(None)` if the file is empty or no `sessionId` is found.
@@ -120,7 +154,6 @@ pub fn parse_session_log(path: &Path) -> Result<Option<BackfilledSession>> {
         return Ok(None);
     }
 
-    // Extract sessionId from the first line that has it.
     let session_id = lines
         .iter()
         .find_map(|entry| {
@@ -131,7 +164,6 @@ pub fn parse_session_log(path: &Path) -> Result<Option<BackfilledSession>> {
         return Ok(None);
     };
 
-    // Extract cwd from any log entry; fall back to the encoded project dir name from the path.
     let project_path: Option<String> = lines
         .iter()
         .find_map(|entry| entry.get("cwd").and_then(|v| v.as_str()).map(|s| s.to_string()))
@@ -142,88 +174,103 @@ pub fn parse_session_log(path: &Path) -> Result<Option<BackfilledSession>> {
                 .map(|s| s.to_string())
         });
 
-    // Determine the first entry's timestamp (used for SessionStart).
     let first_ts = parse_timestamp(lines.first().unwrap());
 
-    // Collect events.
     let mut events: Vec<(DateTime<Utc>, Event)> = Vec::new();
-
-    // Accumulated token totals across all assistant entries.
     let mut total_input: u64 = 0;
     let mut total_output: u64 = 0;
     let mut total_cache_creation: u64 = 0;
     let mut total_cache_read: u64 = 0;
-
-    // Model from the first assistant entry that has one.
     let mut model: Option<String> = None;
-
     let mut last_ts = first_ts;
-
-    // Tool-use events collected during the pass; we emit them after SessionStart.
     let mut tool_use_events: Vec<(DateTime<Utc>, Event)> = Vec::new();
+
+    let mut title: Option<String> = None;
+    let mut summary: Option<String> = None;
+    let mut last_prompt: Option<String> = None;
 
     for entry in &lines {
         let ts = parse_timestamp(entry);
         last_ts = ts;
 
-        if entry.get("type").and_then(|v| v.as_str()) != Some("assistant") {
-            continue;
-        }
+        let entry_type = entry.get("type").and_then(|v| v.as_str());
 
-        let message = match entry.get("message") {
-            Some(m) => m,
-            None => continue,
-        };
-
-        // Capture model from the first assistant entry that provides it.
-        if model.is_none() {
-            if let Some(m) = message.get("model").and_then(|v| v.as_str()) {
-                if !m.is_empty() {
-                    model = Some(m.to_string());
+        match entry_type {
+            Some("ai-title") => {
+                if title.is_none() {
+                    title = entry.get("title").and_then(|v| v.as_str()).map(|s| s.to_string());
                 }
             }
-        }
-
-        // Accumulate token usage.
-        if let Some(usage) = message.get("usage") {
-            total_input += usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-            total_output += usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-            total_cache_creation += usage
-                .get("cache_creation_input_tokens")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            total_cache_read += usage
-                .get("cache_read_input_tokens")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-        }
-
-        // Extract tool_use blocks from message.content[].
-        if let Some(content) = message.get("content").and_then(|v| v.as_array()) {
-            for block in content {
-                if block.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
-                    let tool_name = block
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown")
-                        .to_string();
-                    tool_use_events.push((
-                        ts,
-                        Event::ToolUse {
-                            tool_name,
-                            status: "unknown".to_string(),
-                            duration_ms: None,
-                            error: None,
-                        },
-                    ));
+            Some("last-prompt") => {
+                last_prompt = entry.get("prompt").and_then(|v| v.as_str()).map(|s| s.to_string());
+            }
+            Some("user")
+                if entry
+                    .get("isCompactSummary")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false) =>
+            {
+                if summary.is_none() {
+                    let text = entry.get("message").and_then(|m| extract_content_text(m));
+                    summary = text.map(|t| truncate_chars(t, 2000));
                 }
             }
+            Some("assistant") => {
+                let message = match entry.get("message") {
+                    Some(m) => m,
+                    None => continue,
+                };
+
+                if model.is_none() {
+                    if let Some(m) = message.get("model").and_then(|v| v.as_str()) {
+                        if !m.is_empty() {
+                            model = Some(m.to_string());
+                        }
+                    }
+                }
+
+                if let Some(usage) = message.get("usage") {
+                    total_input +=
+                        usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                    total_output +=
+                        usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                    total_cache_creation += usage
+                        .get("cache_creation_input_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    total_cache_read += usage
+                        .get("cache_read_input_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                }
+
+                if let Some(content) = message.get("content").and_then(|v| v.as_array()) {
+                    for block in content {
+                        if block.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
+                            let tool_name = block
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown")
+                                .to_string();
+                            tool_use_events.push((
+                                ts,
+                                Event::ToolUse {
+                                    tool_name,
+                                    status: "unknown".to_string(),
+                                    duration_ms: None,
+                                    error: None,
+                                },
+                            ));
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
     let final_model = model.unwrap_or_else(|| "unknown".to_string());
 
-    // SessionStart at the first entry's timestamp.
     events.push((
         first_ts,
         Event::SessionStart {
@@ -231,11 +278,8 @@ pub fn parse_session_log(path: &Path) -> Result<Option<BackfilledSession>> {
             source: "backfill".to_string(),
         },
     ));
-
-    // Tool uses in order they were encountered.
     events.extend(tool_use_events);
 
-    // TokenUsage and SessionEnd at the last entry's timestamp.
     let total_tokens = total_input + total_output + total_cache_creation + total_cache_read;
     events.push((
         last_ts,
@@ -250,14 +294,21 @@ pub fn parse_session_log(path: &Path) -> Result<Option<BackfilledSession>> {
     ));
     events.push((last_ts, Event::SessionEnd));
 
-    Ok(Some(BackfilledSession { session_id, project_path, events }))
+    Ok(Some(BackfilledSession {
+        session_id,
+        project_path,
+        source_path: path.to_path_buf(),
+        events,
+        title,
+        summary,
+        last_prompt,
+    }))
 }
 
 /// Decide whether to skip, insert, or replace a session, then act accordingly.
 ///
+/// Also archives the native Claude transcript and populates summary fields.
 /// A session is skipped only if it is fully tracked (has both session_start and session_end).
-/// Partial sessions (e.g. hooks installed mid-session) are replaced with the full log-derived stream.
-/// The delete+insert is wrapped in a transaction so a crash cannot leave the DB in a partial state.
 pub fn backfill_session(session: &BackfilledSession, dry_run: bool) -> Result<BackfillAction> {
     storage::init_db()?;
 
@@ -290,7 +341,13 @@ pub fn backfill_session(session: &BackfilledSession, dry_run: bool) -> Result<Ba
                 }
             }),
             Some("backfill"),
+            session.title.as_deref(),
+            session.summary.as_deref(),
+            session.last_prompt.as_deref(),
         )?;
+        if let Err(e) = storage::archive_transcript(&session.session_id, &session.source_path) {
+            eprintln!("trakr: failed to archive transcript for {}: {}", &session.session_id[..8.min(session.session_id.len())], e);
+        }
     }
 
     Ok(action)
@@ -301,8 +358,7 @@ pub fn backfill_session(session: &BackfilledSession, dry_run: bool) -> Result<Ba
 pub enum TrackingStatus {
     /// No events in the DB for this session.
     Missing,
-    /// Some events exist but the session lacks either a `session_start` or `session_end` —
-    /// e.g. hooks were installed mid-session, or the session ended abnormally.
+    /// Some events exist but the session lacks either a `session_start` or `session_end`.
     Partial,
     /// Has both `session_start` and `session_end` — fully tracked.
     Complete,
@@ -430,7 +486,6 @@ pub fn inspect_logs(
         });
     }
 
-    // Sort by first timestamp ascending, unknowns last.
     summaries.sort_by(|a, b| match (a.first_ts, b.first_ts) {
         (Some(a), Some(b)) => a.cmp(&b),
         (Some(_), None) => std::cmp::Ordering::Less,
@@ -539,7 +594,6 @@ mod tests {
     #[test]
     fn test_parse_token_usage_summed() -> Result<()> {
         let tmp = TempDir::new()?;
-        // Three assistant entries — tokens should be summed.
         let content = r#"{"type":"system","sessionId":"sum1","timestamp":"2026-01-01T10:00:00Z"}
 {"type":"assistant","sessionId":"sum1","timestamp":"2026-01-01T10:01:00Z","message":{"model":"claude-sonnet-4-6","content":[],"usage":{"input_tokens":100,"output_tokens":10,"cache_creation_input_tokens":5,"cache_read_input_tokens":2}}}
 {"type":"assistant","sessionId":"sum1","timestamp":"2026-01-01T10:02:00Z","message":{"model":"claude-sonnet-4-6","content":[],"usage":{"input_tokens":200,"output_tokens":20,"cache_creation_input_tokens":0,"cache_read_input_tokens":50}}}
@@ -575,7 +629,6 @@ mod tests {
     #[test]
     fn test_parse_model_fallback() -> Result<()> {
         let tmp = TempDir::new()?;
-        // No assistant entries at all — model should be "unknown".
         let content = r#"{"type":"system","sessionId":"nomodel","timestamp":"2026-01-01T10:00:00Z"}
 {"type":"user","sessionId":"nomodel","timestamp":"2026-01-01T10:00:01Z","message":{"role":"user","content":"hi"}}
 "#;
@@ -594,6 +647,51 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn test_parse_title_and_summary_extracted() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let content = r#"{"type":"system","sessionId":"recap1","timestamp":"2026-01-01T10:00:00Z"}
+{"type":"ai-title","sessionId":"recap1","timestamp":"2026-01-01T10:01:00Z","title":"Implement transcript archiving"}
+{"type":"user","sessionId":"recap1","timestamp":"2026-01-01T10:02:00Z","isCompactSummary":true,"message":{"role":"user","content":"This session is being continued. Summary: work in progress."}}
+{"type":"last-prompt","sessionId":"recap1","timestamp":"2026-01-01T10:03:00Z","prompt":"update the plan"}
+"#;
+        let path = write_jsonl(&tmp, "recap.jsonl", content);
+        let session = parse_session_log(&path)?.expect("should parse");
+
+        assert_eq!(session.title.as_deref(), Some("Implement transcript archiving"));
+        assert_eq!(session.summary.as_deref(), Some("This session is being continued. Summary: work in progress."));
+        assert_eq!(session.last_prompt.as_deref(), Some("update the plan"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_summary_truncated_to_2000_chars() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let long_text = "x".repeat(3000);
+        let content = format!(
+            r#"{{"type":"system","sessionId":"trunc1","timestamp":"2026-01-01T10:00:00Z"}}
+{{"type":"user","sessionId":"trunc1","timestamp":"2026-01-01T10:01:00Z","isCompactSummary":true,"message":{{"role":"user","content":"{}"}}}}
+"#,
+            long_text
+        );
+        let path = write_jsonl(&tmp, "trunc.jsonl", &content);
+        let session = parse_session_log(&path)?.expect("should parse");
+
+        let summary = session.summary.expect("should have summary");
+        assert_eq!(summary.chars().count(), 2000, "summary should be truncated to 2000 chars");
+        Ok(())
+    }
+
+    #[test]
+    fn test_source_path_set() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let content = r#"{"type":"system","sessionId":"pathtest","timestamp":"2026-01-01T10:00:00Z"}"#;
+        let path = write_jsonl(&tmp, "pathtest.jsonl", content);
+        let session = parse_session_log(&path)?.expect("should parse");
+        assert_eq!(session.source_path, path);
+        Ok(())
+    }
+
     // ── backfill_session tests ────────────────────────────────────────────────
 
     fn make_session(id: &str) -> BackfilledSession {
@@ -601,6 +699,7 @@ mod tests {
         BackfilledSession {
             session_id: id.to_string(),
             project_path: None,
+            source_path: PathBuf::new(), // non-existent — archive_transcript no-ops
             events: vec![
                 (ts, Event::SessionStart { model: "test-model".to_string(), source: "backfill".to_string() }),
                 (ts, Event::TokenUsage {
@@ -613,6 +712,9 @@ mod tests {
                 }),
                 (ts, Event::SessionEnd),
             ],
+            title: None,
+            summary: None,
+            last_prompt: None,
         }
     }
 
@@ -620,7 +722,6 @@ mod tests {
     fn test_backfill_session_skip_when_complete() -> Result<()> {
         let tmp = TempDir::new()?;
         with_home(&tmp, || {
-            // A complete session requires BOTH session_start and session_end.
             storage::insert_event(
                 "complete_session",
                 &Event::SessionStart { model: "m".to_string(), source: "hook".to_string() },
@@ -637,8 +738,6 @@ mod tests {
 
     #[test]
     fn test_backfill_session_replaced_when_only_session_end() -> Result<()> {
-        // A session that has session_end but no session_start (hooks installed mid-session)
-        // should be replaced, not skipped.
         let tmp = TempDir::new()?;
         with_home(&tmp, || {
             storage::insert_event("tail_only_session", &Event::SessionEnd, Utc::now())?;
@@ -671,7 +770,6 @@ mod tests {
     fn test_backfill_session_replaced_when_partial() -> Result<()> {
         let tmp = TempDir::new()?;
         with_home(&tmp, || {
-            // Insert a partial session — has events but no session_end.
             storage::insert_event(
                 "partial_session",
                 &Event::SessionStart { model: "old".to_string(), source: "hook".to_string() },
@@ -682,7 +780,6 @@ mod tests {
             let action = backfill_session(&session, false)?;
             assert!(matches!(action, BackfillAction::Replaced));
 
-            // Verify old event was replaced with the new full set.
             let events = storage::get_events(Some("partial_session"))?;
             assert_eq!(events.len(), 3, "should have 3 events after replace");
             Ok(())
@@ -695,7 +792,6 @@ mod tests {
         with_home(&tmp, || {
             let session = make_session("dry_run_session");
             let action = backfill_session(&session, true)?;
-            // Should report Inserted (no prior data) but write nothing.
             assert!(matches!(action, BackfillAction::Inserted));
 
             let events = storage::get_events(Some("dry_run_session"))?;

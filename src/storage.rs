@@ -23,8 +23,29 @@ fn sessions_dir() -> Result<PathBuf> {
     Ok(base_dir()?.join("sessions"))
 }
 
+/// Returns the transcripts directory: `~/.ctx-trakr/transcripts/`.
+fn transcripts_dir() -> Result<PathBuf> {
+    Ok(base_dir()?.join("transcripts"))
+}
+
 fn jsonl_path(session_id: &str) -> Result<PathBuf> {
     Ok(sessions_dir()?.join(format!("{}.jsonl", session_id)))
+}
+
+/// Copy a Claude native session JSONL to `~/.ctx-trakr/transcripts/<session_id>.jsonl`.
+///
+/// No-ops silently if `source_path` does not exist (best-effort; hook path may race).
+pub fn archive_transcript(session_id: &str, source_path: &std::path::Path) -> Result<()> {
+    if !source_path.exists() {
+        return Ok(());
+    }
+    let dir = transcripts_dir()?;
+    fs::create_dir_all(&dir)
+        .with_context(|| format!("creating transcripts dir {}", dir.display()))?;
+    let dest = dir.join(format!("{}.jsonl", session_id));
+    fs::copy(source_path, &dest)
+        .with_context(|| format!("archiving transcript to {}", dest.display()))?;
+    Ok(())
 }
 
 fn open_db() -> Result<Connection> {
@@ -47,10 +68,13 @@ pub fn init_db() -> Result<()> {
     fs::create_dir_all(&dir)
         .with_context(|| format!("creating base dir {}", dir.display()))?;
 
-    // Also ensure sessions/ exists for JSONL backups.
     let sessions = sessions_dir()?;
     fs::create_dir_all(&sessions)
         .with_context(|| format!("creating sessions dir {}", sessions.display()))?;
+
+    let transcripts = transcripts_dir()?;
+    fs::create_dir_all(&transcripts)
+        .with_context(|| format!("creating transcripts dir {}", transcripts.display()))?;
 
     let conn = open_db()?;
     conn.execute_batch(
@@ -71,6 +95,59 @@ pub fn init_db() -> Result<()> {
         );",
     )
     .context("creating tables")?;
+
+    run_migrations(&conn)?;
+
+    Ok(())
+}
+
+/// Apply any pending schema migrations in order.
+///
+/// Each migration is guarded by a version check — safe to call repeatedly.
+fn run_migrations(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS schema_migrations (
+            version    INTEGER PRIMARY KEY,
+            applied_at TEXT    NOT NULL
+        );"
+    ).context("creating schema_migrations table")?;
+
+    let applied: std::collections::HashSet<i64> = {
+        let mut stmt = conn.prepare("SELECT version FROM schema_migrations")?;
+        let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        rows
+    };
+
+    // v1 — baseline: events + sessions (created above by CREATE TABLE IF NOT EXISTS).
+    if !applied.contains(&1) {
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (1, ?1)",
+            rusqlite::params![Utc::now().to_rfc3339()],
+        ).context("recording migration v1")?;
+    }
+
+    // v2 — add title, summary, last_prompt, generated_summary to sessions.
+    if !applied.contains(&2) {
+        let existing_cols: std::collections::HashSet<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(sessions)")?;
+            let cols = stmt.query_map([], |row| row.get::<_, String>(1))?
+                .filter_map(|r| r.ok())
+                .collect();
+            cols
+        };
+        for col in &["title", "summary", "last_prompt", "generated_summary"] {
+            if !existing_cols.contains(*col) {
+                conn.execute_batch(&format!("ALTER TABLE sessions ADD COLUMN {} TEXT;", col))
+                    .with_context(|| format!("migration v2: adding column {}", col))?;
+            }
+        }
+        conn.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (2, ?1)",
+            rusqlite::params![Utc::now().to_rfc3339()],
+        ).context("recording migration v2")?;
+    }
 
     Ok(())
 }
@@ -258,7 +335,7 @@ pub fn get_monthly_spend_usd(year_month: &str) -> Result<(f64, usize)> {
     Ok((total_usd, completed_this_month.len()))
 }
 
-/// Upsert project/timing/model metadata for a session into the `sessions` table.
+/// Upsert project/timing/model/summary metadata for a session into the `sessions` table.
 ///
 /// Uses COALESCE so partial updates don't overwrite existing values with NULL.
 pub fn upsert_session_meta(
@@ -268,17 +345,23 @@ pub fn upsert_session_meta(
     ended_at: Option<DateTime<Utc>>,
     model: Option<&str>,
     source: Option<&str>,
+    title: Option<&str>,
+    summary: Option<&str>,
+    last_prompt: Option<&str>,
 ) -> Result<()> {
     let conn = open_db()?;
     conn.execute(
-        "INSERT INTO sessions (session_id, project_path, started_at, ended_at, model, source)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        "INSERT INTO sessions (session_id, project_path, started_at, ended_at, model, source, title, summary, last_prompt)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
          ON CONFLICT(session_id) DO UPDATE SET
              project_path = COALESCE(excluded.project_path, sessions.project_path),
              started_at   = COALESCE(excluded.started_at,   sessions.started_at),
              ended_at     = COALESCE(excluded.ended_at,     sessions.ended_at),
              model        = COALESCE(excluded.model,        sessions.model),
-             source       = COALESCE(excluded.source,       sessions.source)",
+             source       = COALESCE(excluded.source,       sessions.source),
+             title        = COALESCE(excluded.title,        sessions.title),
+             summary      = COALESCE(excluded.summary,      sessions.summary),
+             last_prompt  = COALESCE(excluded.last_prompt,  sessions.last_prompt)",
         params![
             session_id,
             project_path,
@@ -286,6 +369,9 @@ pub fn upsert_session_meta(
             ended_at.map(|t| t.to_rfc3339()),
             model,
             source,
+            title,
+            summary,
+            last_prompt,
         ],
     )
     .context("upserting session metadata")?;

@@ -102,16 +102,22 @@ pub fn handle_session_end() -> Result<()> {
                     ended_at,
                     model.as_deref(),
                     Some("hook"),
+                    session.title.as_deref(),
+                    session.summary.as_deref(),
+                    session.last_prompt.as_deref(),
                 ) {
-                    eprintln!("ctx-trakr: failed to write session metadata: {}", e);
+                    eprintln!("trakr: failed to write session metadata: {}", e);
+                }
+                if let Err(e) = storage::archive_transcript(&session_id, &session.source_path) {
+                    eprintln!("trakr: failed to archive transcript: {}", e);
                 }
                 return Ok(());
             }
             Ok(None) => {
-                eprintln!("ctx-trakr: transcript empty or no sessionId found — writing minimal session_end");
+                eprintln!("trakr: transcript empty or no sessionId found — writing minimal session_end");
             }
             Err(e) => {
-                eprintln!("ctx-trakr: failed to parse transcript: {} — writing minimal session_end", e);
+                eprintln!("trakr: failed to parse transcript: {} — writing minimal session_end", e);
             }
         }
     }
