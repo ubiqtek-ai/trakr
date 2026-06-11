@@ -6,7 +6,7 @@ description = "A Rust tool that integrates with Claude Code hooks to track conte
 license = "MIT"
 
 [[bin]]
-name = "ctx-trakr"
+name = "trakr"
 path = "src/main.rs"
 
 [dependencies]
