@@ -7,13 +7,23 @@ use axum::http::StatusCode;
 use axum::routing::post;
 use axum::Router;
 
-/// In-memory map of session_id → cumulative estimated cost in USD from OTEL data.
+/// Shared OTEL receiver state: per-session costs plus receive statistics.
 ///
-/// "Unknown" session is used when no session_id attribute is present in the metric.
-pub type SessionCosts = Arc<Mutex<HashMap<String, f64>>>;
+/// "unknown" session is used when no session.id attribute is present in the metric.
+#[derive(Debug, Default)]
+pub struct OtelState {
+    /// session_id → cumulative estimated cost in USD from OTEL data.
+    pub session_costs: HashMap<String, f64>,
+    /// Number of OTLP metric batches received (any valid POST to /v1/metrics).
+    pub batches_received: u64,
+    /// Timestamp of the most recent batch.
+    pub last_received: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+pub type SessionCosts = Arc<Mutex<OtelState>>;
 
 pub fn new_session_costs() -> SessionCosts {
-    Arc::new(Mutex::new(HashMap::new()))
+    Arc::new(Mutex::new(OtelState::default()))
 }
 
 /// Start the OTLP HTTP/JSON receiver on the given port.
@@ -49,14 +59,19 @@ async fn handle_metrics(
         Err(_) => return StatusCode::BAD_REQUEST,
     };
 
+    {
+        let mut guard = costs.lock().unwrap();
+        guard.batches_received += 1;
+        guard.last_received = Some(chrono::Utc::now());
+    }
+
     if let Some(resource_metrics) = json.get("resourceMetrics").and_then(|v| v.as_array()) {
         for rm in resource_metrics {
-            // session_id may live in Resource attributes.
-            let resource_session_id = extract_string_attr(
+            // session.id may live in Resource attributes.
+            let resource_session_id = extract_session_id(
                 rm.get("resource")
                     .and_then(|r| r.get("attributes"))
                     .and_then(|a| a.as_array()),
-                "session_id",
             );
 
             if let Some(scope_metrics) = rm.get("scopeMetrics").and_then(|v| v.as_array()) {
@@ -106,14 +121,21 @@ fn process_cost_metric(
             continue;
         }
 
-        // Prefer data-point-level session_id, fall back to resource-level, then "unknown".
+        // Prefer data-point-level session.id, fall back to resource-level, then "unknown".
         let dp_attrs = dp.get("attributes").and_then(|a| a.as_array());
-        let session_id = extract_string_attr(dp_attrs, "session_id")
+        let session_id = extract_session_id(dp_attrs)
             .or_else(|| resource_session_id.map(String::from))
             .unwrap_or_else(|| "unknown".to_string());
 
-        *guard.entry(session_id).or_insert(0.0) += value;
+        *guard.session_costs.entry(session_id).or_insert(0.0) += value;
     }
+}
+
+/// Claude Code attaches the session identifier as `session.id` (OTel semantic
+/// convention style). Accept the legacy `session_id` spelling as a fallback.
+fn extract_session_id(attrs: Option<&Vec<serde_json::Value>>) -> Option<String> {
+    extract_string_attr(attrs, "session.id")
+        .or_else(|| extract_string_attr(attrs, "session_id"))
 }
 
 /// Extract a string attribute value from an OTLP attributes array.
@@ -147,15 +169,22 @@ mod tests {
 
     #[test]
     fn extracts_string_attr() {
+        let attrs = vec![json!({"key": "session.id", "value": {"stringValue": "abc123"}})];
+        let result = extract_session_id(Some(&attrs));
+        assert_eq!(result.as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn extracts_legacy_session_id_spelling() {
         let attrs = vec![json!({"key": "session_id", "value": {"stringValue": "abc123"}})];
-        let result = extract_string_attr(Some(&attrs), "session_id");
+        let result = extract_session_id(Some(&attrs));
         assert_eq!(result.as_deref(), Some("abc123"));
     }
 
     #[test]
     fn extracts_missing_attr_returns_none() {
         let attrs = vec![json!({"key": "model", "value": {"stringValue": "claude-sonnet"}})];
-        let result = extract_string_attr(Some(&attrs), "session_id");
+        let result = extract_session_id(Some(&attrs));
         assert!(result.is_none());
     }
 
@@ -167,7 +196,7 @@ mod tests {
             "gauge": {
                 "dataPoints": [
                     {
-                        "attributes": [{"key": "session_id", "value": {"stringValue": "sess1"}}],
+                        "attributes": [{"key": "session.id", "value": {"stringValue": "sess1"}}],
                         "asDouble": 0.05
                     }
                 ]
@@ -176,7 +205,7 @@ mod tests {
         process_cost_metric(&metric, None, &costs);
         process_cost_metric(&metric, None, &costs);
         let guard = costs.lock().unwrap();
-        assert!((guard["sess1"] - 0.10).abs() < 1e-9);
+        assert!((guard.session_costs["sess1"] - 0.10).abs() < 1e-9);
     }
 
     #[test]
@@ -190,7 +219,7 @@ mod tests {
         });
         process_cost_metric(&metric, Some("resource_sess"), &costs);
         let guard = costs.lock().unwrap();
-        assert!((guard["resource_sess"] - 0.03).abs() < 1e-9);
+        assert!((guard.session_costs["resource_sess"] - 0.03).abs() < 1e-9);
     }
 
     #[test]
@@ -204,7 +233,7 @@ mod tests {
         });
         process_cost_metric(&metric, None, &costs);
         let guard = costs.lock().unwrap();
-        assert!((guard["unknown"] - 0.01).abs() < 1e-9);
+        assert!((guard.session_costs["unknown"] - 0.01).abs() < 1e-9);
     }
 
     #[test]
@@ -215,7 +244,7 @@ mod tests {
             "sum": {
                 "dataPoints": [
                     {
-                        "attributes": [{"key": "session_id", "value": {"stringValue": "sum_sess"}}],
+                        "attributes": [{"key": "session.id", "value": {"stringValue": "sum_sess"}}],
                         "asDouble": 0.07
                     }
                 ]
@@ -223,6 +252,6 @@ mod tests {
         });
         process_cost_metric(&metric, None, &costs);
         let guard = costs.lock().unwrap();
-        assert!((guard["sum_sess"] - 0.07).abs() < 1e-9);
+        assert!((guard.session_costs["sum_sess"] - 0.07).abs() < 1e-9);
     }
 }

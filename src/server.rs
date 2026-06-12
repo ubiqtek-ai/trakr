@@ -30,11 +30,25 @@ struct SpendSources {
     completed_sessions_usd: f64,
     completed_sessions_count: usize,
     active_sessions_usd: f64,
+    active_sessions_count: usize,
 }
 
 #[derive(Serialize)]
 struct ErrorResponse {
     error: String,
+}
+
+#[derive(Serialize)]
+struct StatusResponse {
+    otel: OtelStatus,
+}
+
+#[derive(Serialize)]
+struct OtelStatus {
+    batches_received: u64,
+    last_received: Option<String>,
+    active_sessions: usize,
+    active_usd: f64,
 }
 
 fn round2(v: f64) -> f64 {
@@ -44,6 +58,7 @@ fn round2(v: f64) -> f64 {
 pub async fn start_server(port: u16, state: AppState) {
     let app = Router::new()
         .route("/spend/monthly", get(handle_spend_monthly))
+        .route("/status", get(handle_status))
         .with_state(state);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
@@ -81,13 +96,13 @@ async fn handle_spend_monthly(
     })?;
 
     // Sum OTEL costs for sessions not yet completed.
-    let active_usd: f64 = {
+    let (active_count, active_usd) = {
         let guard = state.costs.lock().unwrap();
         guard
+            .session_costs
             .iter()
             .filter(|(session_id, _)| !completed_ids.contains(*session_id))
-            .map(|(_, cost)| cost)
-            .sum()
+            .fold((0usize, 0.0f64), |(n, sum), (_, cost)| (n + 1, sum + cost))
     };
 
     let total = completed_usd + active_usd;
@@ -100,7 +115,20 @@ async fn handle_spend_monthly(
             completed_sessions_usd: round2(completed_usd),
             completed_sessions_count: completed_count,
             active_sessions_usd: round2(active_usd),
+            active_sessions_count: active_count,
         },
         note: "Costs are estimates based on the published Anthropic rate card.",
     }))
+}
+
+async fn handle_status(State(state): State<AppState>) -> Json<StatusResponse> {
+    let guard = state.costs.lock().unwrap();
+    Json(StatusResponse {
+        otel: OtelStatus {
+            batches_received: guard.batches_received,
+            last_received: guard.last_received.map(|t| t.to_rfc3339()),
+            active_sessions: guard.session_costs.len(),
+            active_usd: round2(guard.session_costs.values().sum()),
+        },
+    })
 }

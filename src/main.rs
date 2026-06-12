@@ -54,6 +54,8 @@ enum Commands {
     },
     /// Show month-to-date estimated spend from completed sessions (SQLite only)
     Spend,
+    /// Check the health of the full tracking pipeline (settings, hooks, OTEL, server, DB)
+    Status,
     /// Backfill session data from Claude Code's native session logs
     BackfillLogs {
         /// Only process projects whose path contains this substring
@@ -65,6 +67,9 @@ enum Commands {
         /// Print what would be done without writing to the DB
         #[arg(long)]
         dry_run: bool,
+        /// Backfill even sessions whose log was written recently (possibly still running)
+        #[arg(long)]
+        force: bool,
     },
     /// Show stats about Claude Code's native session logs (read-only diagnostic)
     InspectLogs {
@@ -115,8 +120,9 @@ fn run(cli: Cli) -> Result<()> {
         Commands::Reset { yes } => cmd_reset(yes),
         Commands::Serve { api_port, otel_port } => cmd_serve(api_port, otel_port),
         Commands::Spend => cmd_spend(),
-        Commands::BackfillLogs { project, since, dry_run } => {
-            cmd_backfill_logs(project.as_deref(), since.as_deref(), dry_run)
+        Commands::Status => cmd_status(),
+        Commands::BackfillLogs { project, since, dry_run, force } => {
+            cmd_backfill_logs(project.as_deref(), since.as_deref(), dry_run, force)
         }
         Commands::InspectLogs { project, since, verbose } => {
             cmd_inspect_logs(project.as_deref(), since.as_deref(), verbose)
@@ -198,22 +204,7 @@ fn cmd_init() -> Result<()> {
     }
 
     println!();
-    println!("── OTEL live cost tracking (optional) ──────────────────────────");
-    println!("To enable live spend tracking during active sessions, add these");
-    println!("environment variables to your shell profile (~/.zshrc etc.):");
-    println!();
-    println!("  export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318");
-    println!("  export OTEL_EXPORTER_OTLP_PROTOCOL=http/json");
-    println!();
-    println!("Then run the receiver (or install it as a background service):");
-    println!();
-    println!("  trakr serve               # foreground");
-    println!("  trakr install-service     # start on login via launchd");
-    println!();
-    println!("Safe to configure without the server running — Claude will");
-    println!("silently skip export if trakr serve is not active. Session");
-    println!("costs are always captured at session end via transcript parse.");
-    println!("────────────────────────────────────────────────────────────────");
+    println!("Run `trakr install-service` to start the OTEL receiver on login.");
 
     Ok(())
 }
@@ -297,6 +288,21 @@ fn write_hooks_to_settings() -> Result<()> {
                 }));
             }
         }
+
+        // Write OTEL env vars — scoped to Claude, no shell profile needed.
+        // CLAUDE_CODE_ENABLE_TELEMETRY and OTEL_METRICS_EXPORTER are required:
+        // without them Claude Code exports no telemetry at all.
+        let env_obj = settings_obj.entry("env").or_insert(json!({}));
+        let env_obj = env_obj.as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("env field is not a JSON object"))?;
+        env_obj.entry("CLAUDE_CODE_ENABLE_TELEMETRY")
+            .or_insert(json!("1"));
+        env_obj.entry("OTEL_METRICS_EXPORTER")
+            .or_insert(json!("otlp"));
+        env_obj.entry("OTEL_EXPORTER_OTLP_ENDPOINT")
+            .or_insert(json!("http://localhost:4318"));
+        env_obj.entry("OTEL_EXPORTER_OTLP_PROTOCOL")
+            .or_insert(json!("http/json"));
     }
 
     let json = serde_json::to_string_pretty(&settings)
@@ -736,6 +742,7 @@ fn cmd_backfill_logs(
     project: Option<&str>,
     since: Option<&str>,
     dry_run: bool,
+    force: bool,
 ) -> Result<()> {
     use backfill::BackfillAction;
 
@@ -766,6 +773,7 @@ fn cmd_backfill_logs(
     let mut n_new = 0usize;
     let mut n_replaced = 0usize;
     let mut n_skipped = 0usize;
+    let mut n_live = 0usize;
 
     for path in &paths {
         let project_name = path
@@ -773,6 +781,15 @@ fn cmd_backfill_logs(
             .and_then(|p| p.file_name())
             .and_then(|n| n.to_str())
             .unwrap_or("unknown");
+
+        if !force && backfill::looks_active(path) {
+            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("?");
+            let short = if stem.len() >= 8 { &stem[..8] } else { stem };
+            println!("[live?]   {}  {}  (log written <24 h ago — still running? use --force)",
+                short, project_name);
+            n_live += 1;
+            continue;
+        }
 
         let session = match backfill::parse_session_log(path) {
             Ok(Some(s)) => s,
@@ -830,7 +847,10 @@ fn cmd_backfill_logs(
     }
 
     println!();
-    println!("Done. {} new, {} replaced, {} skipped.", n_new, n_replaced, n_skipped);
+    println!(
+        "Done. {} new, {} replaced, {} skipped, {} possibly active.",
+        n_new, n_replaced, n_skipped, n_live
+    );
 
     Ok(())
 }
@@ -956,8 +976,16 @@ fn run_log_reconciliation() -> Result<()> {
     let paths = backfill::discover_sessions(&projects_dir, None, None)?;
     let mut n_new = 0usize;
     let mut n_replaced = 0usize;
+    let mut n_live = 0usize;
 
     for path in &paths {
+        // A recently-written log probably belongs to a session that is still
+        // running — never stamp those as ended. The real SessionEnd hook (or a
+        // later sweep, once the log has gone quiet) records them.
+        if backfill::looks_active(path) {
+            n_live += 1;
+            continue;
+        }
         if let Ok(Some(session)) = backfill::parse_session_log(path) {
             match backfill::backfill_session(&session, false) {
                 Ok(BackfillAction::Inserted) => n_new += 1,
@@ -971,6 +999,12 @@ fn run_log_reconciliation() -> Result<()> {
         eprintln!(
             "trakr: reconciled {} new, {} replaced session(s) from logs",
             n_new, n_replaced
+        );
+    }
+    if n_live > 0 {
+        eprintln!(
+            "trakr: left {} possibly-active session(s) alone (log written <24 h ago)",
+            n_live
         );
     }
 
@@ -1028,12 +1062,18 @@ fn cmd_spend() -> Result<()> {
             let completed_usd   = sources.and_then(|s| s.get("completed_sessions_usd")).and_then(|v| v.as_f64()).unwrap_or(0.0);
             let completed_count = sources.and_then(|s| s.get("completed_sessions_count")).and_then(|v| v.as_u64()).unwrap_or(0);
             let active_usd      = sources.and_then(|s| s.get("active_sessions_usd")).and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let active_count    = sources.and_then(|s| s.get("active_sessions_count")).and_then(|v| v.as_u64());
 
             println!("Spend  {}  (budget ${:.2})", period, budget);
             println!("{}", "-".repeat(42));
             println!("  {:<30} ${:>8.2}", format!("Completed sessions ({})", completed_count), completed_usd);
             if active_usd > 0.0 {
-                println!("  {:<30} ${:>8.2}", "Active session (live)", active_usd);
+                // Older server binaries don't report the count — fall back to the bare label.
+                let label = match active_count {
+                    Some(n) => format!("Active sessions ({})", n),
+                    None => "Active sessions (live)".to_string(),
+                };
+                println!("  {:<30} ${:>8.2}", label, active_usd);
             }
             println!("{}", "-".repeat(42));
             println!("  {:<30} ${:>8.2}", "Total", total);
@@ -1049,6 +1089,178 @@ fn cmd_spend() -> Result<()> {
     println!("{}", "-".repeat(42));
     println!("  {:<30} ${:>8.2}", "Total", spent);
     println!("(trakr serve not running — active session costs not included)");
+
+    Ok(())
+}
+
+fn cmd_status() -> Result<()> {
+    use ctx_trakr::config;
+
+    let home = dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
+    let cfg = config::load_config()?;
+    let mut problems: Vec<String> = Vec::new();
+
+    let ok = |good: bool| if good { "✓" } else { "✗" };
+
+    // ── Claude Code settings ───────────────────────────────────────────────────
+
+    println!("Claude Code settings  (~/.claude/settings.json)");
+    println!("{}", "-".repeat(60));
+
+    let settings: serde_json::Value = std::fs::read_to_string(home.join(".claude").join("settings.json"))
+        .ok()
+        .and_then(|c| serde_json::from_str(&c).ok())
+        .unwrap_or(serde_json::Value::Null);
+
+    let hook_installed = |event: &str, command: &str| -> bool {
+        settings.get("hooks")
+            .and_then(|h| h.get(event))
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().any(|entry| {
+                entry.get("hooks")
+                    .and_then(|v| v.as_array())
+                    .map(|hs| hs.iter().any(|h| {
+                        h.get("command").and_then(|v| v.as_str()) == Some(command)
+                    }))
+                    .unwrap_or(false)
+            }))
+            .unwrap_or(false)
+    };
+
+    for (event, command) in [
+        ("SessionStart", "trakr hook session-start"),
+        ("SessionEnd",   "trakr hook session-end"),
+    ] {
+        let installed = hook_installed(event, command);
+        println!("  {} {:<32} {}", ok(installed), format!("{} hook", event),
+            if installed { command } else { "not registered" });
+        if !installed {
+            problems.push(format!("{} hook missing — run `trakr init`", event));
+        }
+    }
+
+    // Env vars Claude Code needs before it exports any telemetry.
+    let env = settings.get("env");
+    let expected_env = [
+        ("CLAUDE_CODE_ENABLE_TELEMETRY", "1"),
+        ("OTEL_METRICS_EXPORTER",        "otlp"),
+        ("OTEL_EXPORTER_OTLP_ENDPOINT",  &format!("http://localhost:{}", cfg.otel_port)),
+        ("OTEL_EXPORTER_OTLP_PROTOCOL",  "http/json"),
+    ];
+    for (key, expected) in &expected_env {
+        let actual = env.and_then(|e| e.get(*key)).and_then(|v| v.as_str());
+        let good = actual == Some(expected);
+        let shown = match actual {
+            Some(v) if good => v.to_string(),
+            Some(v) => format!("{}  (expected {})", v, expected),
+            None => format!("not set  (expected {})", expected),
+        };
+        println!("  {} {:<32} {}", ok(good), key, shown);
+        if !good {
+            problems.push(format!("{} — run `trakr init`, then restart Claude Code sessions", key));
+        }
+    }
+
+    // ── Storage ────────────────────────────────────────────────────────────────
+
+    let base = home.join(".trakr");
+    println!();
+    println!("Storage  ({})", base.display());
+    println!("{}", "-".repeat(60));
+
+    let db_path = base.join("trakr.db");
+    let db_summary = if db_path.exists() { storage::get_db_summary().ok().flatten() } else { None };
+    match &db_summary {
+        Some((earliest, latest, count)) => {
+            println!("  {} {:<32} {} sessions  ({} → {})", ok(true), "trakr.db",
+                count, earliest.format("%Y-%m-%d"), latest.format("%Y-%m-%d"));
+        }
+        None => {
+            println!("  {} {:<32} {}", ok(false), "trakr.db",
+                if db_path.exists() { "empty" } else { "missing — run `trakr init`" });
+            if !db_path.exists() {
+                problems.push("DB missing — run `trakr init`".to_string());
+            }
+        }
+    }
+
+    let config_exists = config::config_path()?.exists();
+    println!("  {} {:<32} budget ${:.2}, api :{}, otel :{}{}",
+        ok(config_exists), "config.toml",
+        cfg.monthly_budget_usd, cfg.api_port, cfg.otel_port,
+        if config_exists { "" } else { "  (file missing — using defaults)" });
+
+    let transcripts_dir = base.join("transcripts");
+    let transcript_count = std::fs::read_dir(&transcripts_dir)
+        .map(|rd| rd.filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map_or(false, |x| x == "jsonl"))
+            .count())
+        .unwrap_or(0);
+    println!("  {} {:<32} {} archived", ok(transcripts_dir.exists()), "transcripts/", transcript_count);
+
+    // ── Server ─────────────────────────────────────────────────────────────────
+
+    println!();
+    println!("Server");
+    println!("{}", "-".repeat(60));
+
+    let plist_installed = launch_agent_plist_path().map(|p| p.exists()).unwrap_or(false);
+    println!("  {} {:<32} {}", ok(plist_installed), "launchd service",
+        if plist_installed { LAUNCH_AGENT_LABEL } else { "not installed — run `trakr install-service`" });
+
+    let api_base = format!("http://127.0.0.1:{}", cfg.api_port);
+    let api_up = try_get(&format!("{}/spend/monthly", api_base)).is_some();
+    println!("  {} {:<32} {}", ok(api_up), "API server",
+        if api_up { format!("{} (responding)", api_base) }
+        else { format!("{} not responding — run `trakr serve` or `trakr install-service`", api_base) });
+    if !api_up {
+        problems.push("API server not running".to_string());
+    }
+
+    // OTEL receiver health, as reported by the server's /status endpoint.
+    if let Some(body) = try_get(&format!("{}/status", api_base)) {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
+            let otel = json.get("otel");
+            let batches = otel.and_then(|o| o.get("batches_received")).and_then(|v| v.as_u64()).unwrap_or(0);
+            let last = otel.and_then(|o| o.get("last_received")).and_then(|v| v.as_str());
+            let active = otel.and_then(|o| o.get("active_sessions")).and_then(|v| v.as_u64()).unwrap_or(0);
+            let active_usd = otel.and_then(|o| o.get("active_usd")).and_then(|v| v.as_f64()).unwrap_or(0.0);
+
+            let receiving = batches > 0;
+            let detail = if receiving {
+                format!("{} batches, {} active session(s), ${:.2}  (last: {})",
+                    batches, active, active_usd, last.unwrap_or("unknown"))
+            } else {
+                "no metrics received yet".to_string()
+            };
+            println!("  {} {:<32} {}", ok(receiving), "OTEL receiver", detail);
+            if !receiving {
+                problems.push(
+                    "OTEL receiver has never received metrics — check the env vars above, \
+                     then start a NEW Claude Code session (env changes don't apply to running sessions)"
+                        .to_string(),
+                );
+            }
+        }
+    } else if api_up {
+        // Old server binary without /status — restart picks up the new one.
+        println!("  {} {:<32} {}", ok(false), "OTEL receiver",
+            "server has no /status endpoint — restart it to pick up the new binary");
+        problems.push("server running an old binary — `trakr uninstall-service && trakr install-service`".to_string());
+    }
+
+    // ── Summary ────────────────────────────────────────────────────────────────
+
+    println!();
+    if problems.is_empty() {
+        println!("All checks passed.");
+    } else {
+        println!("{} problem(s) found:", problems.len());
+        for p in &problems {
+            println!("  • {}", p);
+        }
+    }
 
     Ok(())
 }

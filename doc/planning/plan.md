@@ -1,9 +1,9 @@
 # Implementation Plan
 
 ## ── WHAT'S NEXT ──────────────────────────────────────────────────────────
-**Next:** Action 4d.1 — Archive full Claude session transcripts at SessionEnd
+**Next:** Action 4d.3 — Expose title/summary in `list` and `show` CLI commands
 **Sub-doc:** (none)
-**Blockers:** None — `transcript_path` already available in SessionEnd hook payload
+**Blockers:** None — columns already populated in DB
 ─────────────────────────────────────────────────────────────────────────────
 
 ## Phase 1: Project Foundation
@@ -171,20 +171,22 @@ Key findings:
 - No official rotation/pruning policy documented; files appear to persist indefinitely
 
 ### Action 4d.1: Archive full Claude transcripts at SessionEnd
-- TODO - At `SessionEnd`, copy native JSONL (`transcript_path`) to `~/.ctx-trakr/transcripts/<session-id>.jsonl`
-- TODO - Add `transcripts/` dir creation to `cmd_init` and `init_db()`
-- TODO - User owns retention; no auto-pruning in ctx-trakr
+- ✓ DONE - At `SessionEnd`, copy native JSONL (`transcript_path`) to `~/.trakr/transcripts/<session-id>.jsonl`
+- ✓ DONE - Add `transcripts/` dir creation to `cmd_init` and `init_db()`
+- ✓ DONE - `backfill_session` also archives from `source_path` — backfill path covered
+- ✓ DONE - User owns retention; no auto-pruning in trakr
 
 ### Action 4d.2: Extract summary fields into `sessions` table
-- TODO - Parse `ai-title` line → `sessions.title` column
-- TODO - Parse first `isCompactSummary:true` user message text → `sessions.summary` column
-- TODO - Parse `last-prompt` line → `sessions.last_prompt` column (truncated last user turn)
-- TODO - Schema migration: add `title`, `summary`, `last_prompt` columns to `sessions` table
-- TODO - Populate from both hook path (live) and backfill path
+- ✓ DONE - Schema migrations: `schema_migrations` version table, v1 baseline, v2 adds `title`, `summary`, `last_prompt`, `generated_summary` columns
+- ✓ DONE - Parse `ai-title` line → `sessions.title` column
+- ✓ DONE - Parse first `isCompactSummary:true` user message text → `sessions.summary` column (truncated to 2000 chars)
+- ✓ DONE - Parse `last-prompt` line → `sessions.last_prompt` column
+- ✓ DONE - Populated from both hook path (live) and backfill path
+- NOTE - `generated_summary` column exists, stays null until Haiku inference wired up
 
 ### Action 4d.3: Expose in CLI
-- TODO - `ctx-trakr show <session>` — print `title` + `summary` if present
-- TODO - `ctx-trakr list` — show title alongside session ID and project
+- TODO - `trakr show <session>` — print `title` + `summary` if present
+- TODO - `trakr list` — show title alongside session ID and project
 
 ## Phase 5: Polish & Release
 
@@ -195,8 +197,8 @@ Key findings:
 
 ### Action 5.2: Documentation
 - ✓ DONE - README: installation, hook setup, spend/serve workflow, tmux status-line example, config reference, all commands, cost table
-- TODO - Update README to reflect new SessionEnd-only hook architecture
-- TODO - Troubleshooting guide (OTEL not connecting, DB missing, etc.)
+- ✓ DONE - Update README to reflect new SessionEnd-only hook architecture (rewritten 2026-06-11: `trakr` binary name, `~/.trakr/` paths, port 8788, init-writes-everything flow, status/service/logs commands, "How tracking works" section)
+- ✓ DONE - Troubleshooting guide (OTEL not connecting, DB missing, etc.) — README Troubleshooting section: OTEL never-received (new-session requirement, ~60 s export interval), http/json-only protocol, port clashes, low spend, stale binary
 
 ### Action 5.3: Crates.io publication
 - TODO - Final dependency audit
@@ -301,6 +303,63 @@ Key findings:
 2. Action 4d.2 — add `title`, `summary`, `last_prompt` columns to `sessions` table; parse from transcript
 3. Action 4d.3 — surface title/summary in `list` and `show` CLI commands
 4. Update README to reflect SessionEnd-only hook architecture (carried over from 4c)
+
+─────────────────────────────────────────────────────────────────────────────
+
+## ── CHECKPOINT: Session 2026-06-11 (transcript archiving + polish) ────────
+
+**What was completed this session:**
+- Phase 4d fully implemented (4d.1 + 4d.2): transcript archiving and summary extraction
+  - `storage::archive_transcript()` — copies native Claude JSONL to `~/.trakr/transcripts/`
+  - Schema migrations (v1/v2) — `schema_migrations` table; `title`, `summary`, `last_prompt`, `generated_summary` columns added
+  - `BackfilledSession` extended with `source_path`, `title`, `summary`, `last_prompt`
+  - `parse_session_log` extracts `ai-title`, `isCompactSummary` text (≤2000 chars), `last-prompt`
+  - Both hook and backfill paths archive + populate summary fields
+- Binary renamed `ctx-trakr` → `trakr`; home dir `~/.ctx-trakr` → `~/.trakr`; DB `ctx-trakr.db` → `trakr.db`
+- `trakr install-service` / `trakr uninstall-service` — launchd LaunchAgent management
+- `trakr logs` — tails `~/.trakr/serve.log`
+- `trakr spend` hits live API first, falls back to SQLite; shows completed/active/total breakdown
+- Default API port changed 8787 → 8788 (clash with workerd)
+- `trakr init` writes OTEL env vars into `~/.claude/settings.json` — no shell profile needed
+- 54 tests passing (3 new tests for title/summary extraction, truncation, source_path)
+
+**State of the project:**
+- `trakr serve` running as launchd service; API on :8788, OTEL on :4318
+- `trakr spend` shows $315.40 / $200.00 (38 completed sessions, reconciled on serve startup)
+- Transcripts archiving to `~/.trakr/transcripts/` from next SessionEnd onwards
+- 54 tests passing; `cargo build` clean
+
+**Immediate next priorities:**
+1. Action 4d.3 — surface `title`/`summary` in `trakr list` and `trakr show`
+2. Update README to reflect new binary name, home dir, SessionEnd-only hooks, service commands
+3. Filtering/JSON output on `list`, `show`, `stats`
+4. CI/CD and crates.io publication
+
+─────────────────────────────────────────────────────────────────────────────
+
+## ── CHECKPOINT: Session 2026-06-11 (OTEL verified end-to-end + README) ────
+
+**What was completed this session:**
+- OTEL pipeline verified end-to-end for the first time with a real Claude Code session:
+  - `trakr init` env vars (`CLAUDE_CODE_ENABLE_TELEMETRY`, `OTEL_METRICS_EXPORTER`, `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_PROTOCOL=http/json`) confirmed picked up by a fresh session
+  - Receiver on :4318 ingested live batches; `trakr status` showed `✓ OTEL receiver — 1 batches, 1 active session(s), $0.27`
+  - `trakr spend` showed the live line for the first time: 42 completed ($329.69) + active ($0.27) = $329.96, no double-counting
+  - Key operational learning (now in README): env changes apply only to NEW sessions, and the first metrics batch lands ~60 s in (Claude Code's export interval) — `trakr status` correctly flags this window as a problem until the first batch arrives
+- README rewritten to match the current architecture (closes both remaining Action 5.2 TODOs):
+  - `trakr` binary name, `~/.trakr/` paths, API port 8788, SessionStart/SessionEnd-only hooks
+  - Quick start reflects that `init` now writes hooks AND env vars itself; added the new-session restart step
+  - New sections: "How tracking works" (SessionEnd transcript parse, OTEL gap-fill, reconciliation sweep) and "Troubleshooting"
+  - Documented `status`, `install-service`/`uninstall-service`, `logs`, `backfill-logs`, `inspect-logs`, `show-prompts`; updated storage layout (transcripts/, serve.log, sessions table columns)
+
+**State of the project:**
+- Full pipeline live: launchd service running `trakr serve` (API :8788, OTEL :4318), hooks rolling sessions into SQLite, OTEL feeding active-session spend. `trakr status` passes all checks. No code changes this session (docs + verification only); binary unchanged, 54 tests passing.
+- Untested seam: the active→completed handoff (live cost dropping out of the OTEL total once SessionEnd lands) hasn't been observed for the verifying session yet — worth a glance at the next `trakr spend`.
+
+**Immediate next priorities:**
+1. Action 4d.3 — surface `title`/`summary` in `trakr list` and `trakr show`
+2. Verify active→completed spend handoff (no double-count, no gap) after a tracked session ends
+3. Filtering/JSON output on `list`, `show`, `stats`
+4. CI/CD and crates.io publication
 
 ─────────────────────────────────────────────────────────────────────────────
 

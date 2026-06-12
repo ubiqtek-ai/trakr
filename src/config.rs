@@ -97,7 +97,7 @@ mod tests {
         with_home(&tmp, || {
             let cfg = load_config()?;
             assert_eq!(cfg.monthly_budget_usd, 50.0);
-            assert_eq!(cfg.api_port, 8787);
+            assert_eq!(cfg.api_port, 8788);
             assert_eq!(cfg.otel_port, 4318);
             Ok(())
         })
@@ -114,7 +114,7 @@ mod tests {
         with_home(&tmp, || {
             let cfg = load_config()?;
             assert_eq!(cfg.monthly_budget_usd, 100.0);
-            assert_eq!(cfg.api_port, 8787); // still default
+            assert_eq!(cfg.api_port, 8788); // still default
             Ok(())
         })
         .unwrap();

@@ -18,6 +18,25 @@ pub struct BackfilledSession {
     pub last_prompt: Option<String>,
 }
 
+/// How long a session log must be untouched before backfill may treat the session
+/// as ended. A running session — even days old — writes to its log whenever it is
+/// used, so a fresh mtime means "probably still alive: never stamp a session_end".
+/// A wrong guess self-heals: the real SessionEnd hook replaces the record anyway.
+pub const ACTIVE_LOG_WINDOW: std::time::Duration =
+    std::time::Duration::from_secs(24 * 60 * 60);
+
+/// True if the log file was modified within [`ACTIVE_LOG_WINDOW`] — i.e. the
+/// session may still be running and must not be backfilled.
+pub fn looks_active(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else { return false };
+    let Ok(mtime) = meta.modified() else { return false };
+    match mtime.elapsed() {
+        Ok(age) => age < ACTIVE_LOG_WINDOW,
+        // mtime in the future (clock skew) — err on the side of "alive".
+        Err(_) => true,
+    }
+}
+
 /// Outcome of attempting to backfill a single session.
 pub enum BackfillAction {
     /// A `session_end` was already present in the DB — nothing changed.
@@ -533,6 +552,32 @@ mod tests {
         let mut f = std::fs::File::create(&path).unwrap();
         f.write_all(content.as_bytes()).unwrap();
         path
+    }
+
+    // ── looks_active tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_looks_active_fresh_log() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let path = write_jsonl(&tmp, "fresh.jsonl", "{}");
+        assert!(looks_active(&path), "just-written log should look active");
+        Ok(())
+    }
+
+    #[test]
+    fn test_looks_active_old_log() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let path = write_jsonl(&tmp, "old.jsonl", "{}");
+        let old_mtime = std::time::SystemTime::now() - (ACTIVE_LOG_WINDOW * 2);
+        let f = std::fs::File::options().write(true).open(&path)?;
+        f.set_times(std::fs::FileTimes::new().set_modified(old_mtime))?;
+        assert!(!looks_active(&path), "log untouched for 2× the window should not look active");
+        Ok(())
+    }
+
+    #[test]
+    fn test_looks_active_missing_file() {
+        assert!(!looks_active(Path::new("/nonexistent/never.jsonl")));
     }
 
     // ── parse_session_log tests ───────────────────────────────────────────────
