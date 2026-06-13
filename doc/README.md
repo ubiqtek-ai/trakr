@@ -31,9 +31,27 @@
   double-counting problem dissolves under a single-ledger,
   watcher-driven design. Recommends the architecture change and lists open
   risks to verify (message-id dedup on resume, sidechain usage).
+- **[session-lifecycle.md](session-lifecycle.md)** — The three-category
+  session model (known-complete / active / ended-unhooked) and the 2026-06-11
+  reconciliation bug that motivated it. Superseded by the event-sourced
+  design but the model still stands.
+- **[event-sourced-sessions.md](event-sourced-sessions.md)** — Design
+  principles: the event store holds only observed facts (backfill never
+  writes a `session_end`), spend doesn't care about endings, derived state
+  lives in a rebuildable projection.
+- **[transcript-structure.md](transcript-structure.md)** — Empirical analysis
+  of the native transcript format (entry census, subagent files, usage
+  duplicated per content block → ~2× spend overstatement), and the
+  three-layer architecture: raw transcripts → per-agent adapter →
+  agent-agnostic typed events → projections. Records the 2026-06-12 decision
+  to park OTEL and hooks.
 
 ## Planning
 
 - **[planning/plan.md](planning/plan.md)** — Living implementation plan:
   phase-by-phase actions with status, session checkpoints, and architecture
   notes. Start here to see what's done and what's next.
+- **[planning/single-ledger-plan.md](planning/single-ledger-plan.md)** —
+  Self-contained execution plan for the single-ledger redesign (parser
+  dedupe, subagent inclusion, spend without endings, sampling loop, archive
+  sweep), written to hand to an implementation agent.
