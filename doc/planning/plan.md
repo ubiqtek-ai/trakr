@@ -1,9 +1,9 @@
 # Implementation Plan
 
 ## ── WHAT'S NEXT ──────────────────────────────────────────────────────────
-**Next:** Action 4d.3 — Expose title/summary in `list` and `show` CLI commands
-**Sub-doc:** (none)
-**Blockers:** None — columns already populated in DB
+**Next:** Phase A — Single-ledger parser correctness (dedupe, per-model pricing, subagents, spend query)
+**Sub-doc:** `planning/single-ledger-plan.md`
+**Blockers:** None — execution plan is complete and self-contained; hand to Sonnet agent or implement directly
 ─────────────────────────────────────────────────────────────────────────────
 
 ## Phase 1: Project Foundation
@@ -360,6 +360,35 @@ Key findings:
 2. Verify active→completed spend handoff (no double-count, no gap) after a tracked session ends
 3. Filtering/JSON output on `list`, `show`, `stats`
 4. CI/CD and crates.io publication
+
+─────────────────────────────────────────────────────────────────────────────
+
+## ── CHECKPOINT: Session 2026-06-13 (architecture redesign + single-ledger plan) ────
+
+**What was completed this session:**
+- Identified critical bugs in current spend pipeline: ~2.3× output token overstatement (usage duplicated per content block, no `message.id` dedupe) and ~19% usage invisibility (subagent files never scanned)
+- Empirical corpus analysis: 126 JSONL files, 61 MB, 23 projects — measured impact in `doc/transcript-structure.md` §3
+- Architectural decision: **OTEL and hooks parked** — Claude's transcripts are now the single spend source; dual-pipeline complexity eliminated
+- New docs written:
+  - `doc/session-lifecycle.md` — three-category session model (known-complete / active / ended-unhooked), 2026-06-11 reconciliation bug
+  - `doc/event-sourced-sessions.md` — event sourcing design principles (event store = observed facts only; spend never keys on endings; projection table for derived state)
+  - `doc/transcript-structure.md` — empirical format analysis, 2× overstatement finding, three-layer architecture, archive strategy (two decoupled loops)
+  - `doc/planning/single-ledger-plan.md` — self-contained Sonnet execution plan for all four phases (A: parser, B: serve loop, C: archive, D: docs)
+  - `doc/README.md` — indexed all new docs
+- Interim code changes (to be superseded by single-ledger plan):
+  - `src/server.rs`: `active_sessions_count` field added to spend response
+  - `src/main.rs`: spend CLI shows "Active sessions (N)"; `backfill-logs --force` flag; `[live?]` skip counter
+  - `src/backfill.rs`: `looks_active()` mtime guard (`ACTIVE_LOG_WINDOW = 24h`); 3 tests
+
+**State of the project:**
+- `trakr serve` still running old binary (launchd service not restarted); working-tree changes uncommitted. `trakr spend` shows ~$330 (likely ~$150–170 real, given the 2.3× overstatement). `cargo build` clean; 54 tests passing (3 new from liveness guard). Two sessions wrongly stamped `session_end` by backfill on 2026-06-11 — will self-heal when they genuinely end.
+
+**Immediate next priorities:**
+1. Implement Phase A of `planning/single-ledger-plan.md` — fix dedupe, per-model pricing, subagent inclusion, spend query (the money bugs)
+2. Implement Phase B — backfill never writes `session_end`, remove liveness guard, 30 s sampling loop, drop OTEL term from spend endpoint
+3. Implement Phase C — `src/archive.rs`, `trakr archive` command, daily timer in serve
+4. Run `trakr repair --dry-run` and report; leave the real repair run to Jim
+5. Action 4d.3 (title/summary in `list`/`show`) — deprioritised pending single-ledger work
 
 ─────────────────────────────────────────────────────────────────────────────
 
