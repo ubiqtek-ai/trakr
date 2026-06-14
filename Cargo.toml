@@ -1,9 +1,13 @@
 [package]
-name = "ctx-trakr"
+name = "trakr"
 version = "0.1.0"
 edition = "2021"
-description = "A Rust tool that integrates with Claude Code hooks to track context, tools, models, and agents."
+description = "Track Claude Code session spend, tool use, and model usage from native session transcripts."
+homepage = "https://github.com/ubiqtek-ai/trakr"
+repository = "https://github.com/ubiqtek-ai/trakr"
 license = "MIT"
+keywords = ["claude", "ai", "spend", "tracking", "cli"]
+categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
 name = "trakr"

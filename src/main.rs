@@ -8,10 +8,10 @@ macro_rules! tlog {
     };
 }
 
-use ctx_trakr::archive;
-use ctx_trakr::backfill;
-use ctx_trakr::hooks;
-use ctx_trakr::storage;
+use trakr::archive;
+use trakr::backfill;
+use trakr::hooks;
+use trakr::storage;
 
 /// Stats returned by `run_log_reconciliation`.
 struct ReconcileStats {
@@ -181,7 +181,7 @@ fn dispatch_hook(event_type: &str) -> Result<()> {
 fn handle_unknown_hook(hook_event_name: &str) -> Result<()> {
     use std::io::Read;
     use chrono::Utc;
-    use ctx_trakr::event::Event;
+    use trakr::event::Event;
 
     let mut raw = String::new();
     std::io::stdin()
@@ -221,7 +221,7 @@ fn cmd_init() -> Result<()> {
     fs::create_dir_all(&archive_dir)?;
 
     storage::init_db()?;
-    ctx_trakr::config::write_default_config()?;
+    trakr::config::write_default_config()?;
 
     println!("trakr: initialised {}", base.display());
     println!("trakr: unified DB:         {}", base.join("trakr.db").display());
@@ -320,7 +320,7 @@ fn cmd_list() -> Result<()> {
 fn cmd_migrate() -> Result<()> {
     use std::fs;
     use chrono::Utc;
-    use ctx_trakr::event::Event;
+    use trakr::event::Event;
 
     let home = dirs::home_dir()
         .ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
@@ -470,7 +470,7 @@ fn cmd_migrate() -> Result<()> {
 }
 
 fn cmd_show(session_id: &str) -> Result<()> {
-    use ctx_trakr::event::Event;
+    use trakr::event::Event;
 
     let events = storage::get_events(Some(session_id))?;
 
@@ -539,7 +539,7 @@ fn cmd_show(session_id: &str) -> Result<()> {
 }
 
 fn cmd_stats() -> Result<()> {
-    use ctx_trakr::event::Event;
+    use trakr::event::Event;
     use std::collections::HashMap;
 
     let all_events = storage::get_events(None)?;
@@ -732,7 +732,7 @@ fn cmd_backfill_logs(
                 let tool_uses = session
                     .events
                     .iter()
-                    .filter(|(_, e)| matches!(e, ctx_trakr::event::Event::ToolUse { .. }))
+                    .filter(|(_, e)| matches!(e, trakr::event::Event::ToolUse { .. }))
                     .count();
                 println!(
                     "[new]     {}  {}  →  {} tool uses",
@@ -749,7 +749,7 @@ fn cmd_backfill_logs(
                 let tool_uses = session
                     .events
                     .iter()
-                    .filter(|(_, e)| matches!(e, ctx_trakr::event::Event::ToolUse { .. }))
+                    .filter(|(_, e)| matches!(e, trakr::event::Event::ToolUse { .. }))
                     .count();
                 println!(
                     "[replace] {}  {}  →  {} tool uses",
@@ -1085,9 +1085,9 @@ fn peek_session_id(path: &std::path::Path) -> Option<String> {
 }
 
 fn cmd_serve(api_port_override: Option<u16>, _otel_port_override: Option<u16>) -> Result<()> {
-    use ctx_trakr::config;
-    use ctx_trakr::otel_receiver;
-    use ctx_trakr::server::{AppState, start_server};
+    use trakr::config;
+    use trakr::otel_receiver;
+    use trakr::server::{AppState, start_server};
 
     let cfg = config::load_config()?;
     let api_port = api_port_override.unwrap_or(cfg.api_port);
@@ -1133,7 +1133,7 @@ fn cmd_serve(api_port_override: Option<u16>, _otel_port_override: Option<u16>) -
         // Spawn a daily rates refresh task. Runs once at startup then every 24 h.
         tokio::spawn(async {
             loop {
-                let result = tokio::task::spawn_blocking(|| ctx_trakr::rates::refresh_rates()).await;
+                let result = tokio::task::spawn_blocking(|| trakr::rates::refresh_rates()).await;
                 match result {
                     Ok(Ok(n))  => tlog!("trakr: rates refreshed: {} Claude models", n),
                     Ok(Err(e)) => tlog!("trakr: rates refresh warning: {:#}", e),
@@ -1197,7 +1197,7 @@ fn cmd_serve(api_port_override: Option<u16>, _otel_port_override: Option<u16>) -
 }
 
 fn cmd_spend(json: bool) -> Result<()> {
-    use ctx_trakr::config;
+    use trakr::config;
 
     let cfg = config::load_config()?;
     let year_month = Utc::now().format("%Y-%m").to_string();
@@ -1291,7 +1291,7 @@ fn cmd_sync() -> Result<()> {
 }
 
 fn cmd_sync_rates() -> Result<()> {
-    use ctx_trakr::rates;
+    use trakr::rates;
     use std::io::Write as IoWrite;
 
     let (msg, summary) = match rates::refresh_rates() {
@@ -1320,7 +1320,7 @@ fn cmd_sync_rates() -> Result<()> {
 }
 
 fn cmd_status() -> Result<()> {
-    use ctx_trakr::config;
+    use trakr::config;
 
     let home = dirs::home_dir()
         .ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
@@ -1404,7 +1404,7 @@ fn cmd_status() -> Result<()> {
         .unwrap_or(0);
     println!("  {} {:<32} {} archived", ok(transcripts_dir.exists()), "transcripts/", transcript_count);
 
-    let rates_label = match ctx_trakr::rates::last_fetched_at() {
+    let rates_label = match trakr::rates::last_fetched_at() {
         Some(dt) => {
             let age_mins = Utc::now().signed_duration_since(dt).num_minutes();
             let when = if age_mins < 60 {
@@ -1418,7 +1418,7 @@ fn cmd_status() -> Result<()> {
         }
         None => "not fetched yet — run `trakr sync-rates`".to_string(),
     };
-    let rates_fresh = ctx_trakr::rates::last_fetched_at()
+    let rates_fresh = trakr::rates::last_fetched_at()
         .map(|dt| Utc::now().signed_duration_since(dt).num_hours() < 48)
         .unwrap_or(false);
     println!("  {} {:<32} {}", ok(rates_fresh), "rates.json", rates_label);
