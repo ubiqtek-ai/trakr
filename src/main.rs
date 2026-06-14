@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use chrono::Utc;
+use chrono::{Datelike, Utc};
 
+use ctx_trakr::archive;
 use ctx_trakr::backfill;
 use ctx_trakr::hooks;
 use ctx_trakr::storage;
@@ -67,9 +68,13 @@ enum Commands {
         /// Print what would be done without writing to the DB
         #[arg(long)]
         dry_run: bool,
-        /// Backfill even sessions whose log was written recently (possibly still running)
+    },
+    /// Repair DB rows built by the old (over-counting) parser — re-backfills every session
+    /// whose transcript still exists; leaves sessions with no surviving transcript untouched.
+    Repair {
+        /// Show what would be done without writing to the DB
         #[arg(long)]
-        force: bool,
+        dry_run: bool,
     },
     /// Show stats about Claude Code's native session logs (read-only diagnostic)
     InspectLogs {
@@ -98,6 +103,8 @@ enum Commands {
     InstallService,
     /// Remove the trakr LaunchAgent
     UninstallService,
+    /// Copy Claude transcripts from ~/.claude/projects/ into ~/.trakr/archive/ (incremental)
+    Archive,
 }
 
 fn main() {
@@ -121,9 +128,10 @@ fn run(cli: Cli) -> Result<()> {
         Commands::Serve { api_port, otel_port } => cmd_serve(api_port, otel_port),
         Commands::Spend => cmd_spend(),
         Commands::Status => cmd_status(),
-        Commands::BackfillLogs { project, since, dry_run, force } => {
-            cmd_backfill_logs(project.as_deref(), since.as_deref(), dry_run, force)
+        Commands::BackfillLogs { project, since, dry_run } => {
+            cmd_backfill_logs(project.as_deref(), since.as_deref(), dry_run)
         }
+        Commands::Repair { dry_run } => cmd_repair(dry_run),
         Commands::InspectLogs { project, since, verbose } => {
             cmd_inspect_logs(project.as_deref(), since.as_deref(), verbose)
         }
@@ -131,6 +139,7 @@ fn run(cli: Cli) -> Result<()> {
         Commands::Logs { lines } => cmd_logs(lines),
         Commands::InstallService => cmd_install_service(),
         Commands::UninstallService => cmd_uninstall_service(),
+        Commands::Archive => cmd_archive(),
     }
 }
 
@@ -180,8 +189,10 @@ fn cmd_init() -> Result<()> {
     let base = home.join(".trakr");
     let sessions = base.join("sessions");
     let transcripts = base.join("transcripts");
+    let archive_dir = base.join("archive");
     fs::create_dir_all(&sessions)?;
     fs::create_dir_all(&transcripts)?;
+    fs::create_dir_all(&archive_dir)?;
 
     storage::init_db()?;
     ctx_trakr::config::write_default_config()?;
@@ -190,6 +201,7 @@ fn cmd_init() -> Result<()> {
     println!("trakr: unified DB:         {}", base.join("trakr.db").display());
     println!("trakr: sessions directory: {}", sessions.display());
     println!("trakr: transcripts:        {}", transcripts.display());
+    println!("trakr: archive:            {}", archive_dir.display());
     println!("trakr: config:             {}", base.join("config.toml").display());
 
     match write_hooks_to_settings() {
@@ -742,7 +754,6 @@ fn cmd_backfill_logs(
     project: Option<&str>,
     since: Option<&str>,
     dry_run: bool,
-    force: bool,
 ) -> Result<()> {
     use backfill::BackfillAction;
 
@@ -773,7 +784,6 @@ fn cmd_backfill_logs(
     let mut n_new = 0usize;
     let mut n_replaced = 0usize;
     let mut n_skipped = 0usize;
-    let mut n_live = 0usize;
 
     for path in &paths {
         let project_name = path
@@ -781,15 +791,6 @@ fn cmd_backfill_logs(
             .and_then(|p| p.file_name())
             .and_then(|n| n.to_str())
             .unwrap_or("unknown");
-
-        if !force && backfill::looks_active(path) {
-            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("?");
-            let short = if stem.len() >= 8 { &stem[..8] } else { stem };
-            println!("[live?]   {}  {}  (log written <24 h ago — still running? use --force)",
-                short, project_name);
-            n_live += 1;
-            continue;
-        }
 
         let session = match backfill::parse_session_log(path) {
             Ok(Some(s)) => s,
@@ -822,14 +823,16 @@ fn cmd_backfill_logs(
                     .iter()
                     .filter(|(_, e)| matches!(e, ctx_trakr::event::Event::ToolUse { .. }))
                     .count();
-                // Assistant turns = number of TokenUsage events (one per session here, but
-                // we count assistant entries indirectly via tool-use bearing turns).
-                // We emit one TokenUsage per session so we count ToolUse to proxy turns.
                 println!(
                     "[new]     {}  {}  →  {} tool uses",
                     short_id, project_name, tool_uses
                 );
                 n_new += 1;
+
+                // Update file metadata for change detection in future sweeps.
+                if !dry_run {
+                    update_file_meta_for_path(&session.session_id, path, &session.last_activity_at);
+                }
             }
             BackfillAction::Replaced => {
                 let tool_uses = session
@@ -842,17 +845,70 @@ fn cmd_backfill_logs(
                     short_id, project_name, tool_uses
                 );
                 n_replaced += 1;
+
+                // Update file metadata for change detection in future sweeps.
+                if !dry_run {
+                    update_file_meta_for_path(&session.session_id, path, &session.last_activity_at);
+                }
             }
         }
     }
 
     println!();
     println!(
-        "Done. {} new, {} replaced, {} skipped, {} possibly active.",
-        n_new, n_replaced, n_skipped, n_live
+        "Done. {} new, {} replaced, {} skipped.",
+        n_new, n_replaced, n_skipped
     );
 
     Ok(())
+}
+
+/// Update file-metadata columns in the sessions table after a successful backfill.
+///
+/// Computes a composite (size, mtime) that covers both the main file and any subagent
+/// files so that the change-detection logic in `run_log_reconciliation` stays accurate.
+fn update_file_meta_for_path(
+    session_id: &str,
+    main_path: &std::path::Path,
+    last_activity_at: &chrono::DateTime<Utc>,
+) {
+    let meta = composite_file_meta(main_path);
+    if let Some((size, mtime)) = meta {
+        let _ = storage::update_session_file_meta(
+            session_id,
+            size,
+            &mtime,
+            Some(&last_activity_at.to_rfc3339()),
+        );
+    }
+}
+
+/// Compute a composite (total_size, max_mtime_rfc3339) across the main file and its subagent files.
+///
+/// Returns None if the main file's metadata is unreadable.
+fn composite_file_meta(main_path: &std::path::Path) -> Option<(i64, String)> {
+    use backfill::discover_subagent_files_pub;
+
+    let main_meta = std::fs::metadata(main_path).ok()?;
+    let main_size = main_meta.len() as i64;
+    let main_mtime: chrono::DateTime<Utc> = main_meta.modified().ok()?.into();
+
+    let mut total_size = main_size;
+    let mut max_mtime = main_mtime;
+
+    for sub_path in discover_subagent_files_pub(main_path) {
+        if let Ok(sub_meta) = std::fs::metadata(&sub_path) {
+            total_size += sub_meta.len() as i64;
+            if let Ok(sub_mtime_sys) = sub_meta.modified() {
+                let sub_mtime: chrono::DateTime<Utc> = sub_mtime_sys.into();
+                if sub_mtime > max_mtime {
+                    max_mtime = sub_mtime;
+                }
+            }
+        }
+    }
+
+    Some((total_size, max_mtime.to_rfc3339()))
 }
 
 fn cmd_inspect_logs(project: Option<&str>, since: Option<&str>, verbose: bool) -> Result<()> {
@@ -960,9 +1016,16 @@ fn cmd_inspect_logs(project: Option<&str>, since: Option<&str>, verbose: bool) -
     Ok(())
 }
 
-/// Silently backfill any log-file sessions not yet fully recorded in the DB.
+/// Silently sweep all Claude log files, inserting or updating any session that has changed.
 ///
-/// Called on `serve` startup so a missed SessionEnd hook self-heals before logs are pruned.
+/// B2: The old liveness guard (`looks_active` / `ACTIVE_LOG_WINDOW`) is removed. Re-parsing a
+/// running session is now safe — no synthetic `session_end` is written, and `replace_session`
+/// is idempotent. The sweep runs every 30 s in the serve loop (B3) so the spend figure stays
+/// fresh without manual intervention.
+///
+/// B3 change detection: the main file's (size, mtime) and composite subagent totals are
+/// compared against what is stored in `sessions.file_size` / `sessions.file_mtime`. If nothing
+/// changed, that session is skipped. After a successful parse+replace the columns are updated.
 fn run_log_reconciliation() -> Result<()> {
     use backfill::BackfillAction;
 
@@ -976,39 +1039,66 @@ fn run_log_reconciliation() -> Result<()> {
     let paths = backfill::discover_sessions(&projects_dir, None, None)?;
     let mut n_new = 0usize;
     let mut n_replaced = 0usize;
-    let mut n_live = 0usize;
+    let mut n_unchanged = 0usize;
 
     for path in &paths {
-        // A recently-written log probably belongs to a session that is still
-        // running — never stamp those as ended. The real SessionEnd hook (or a
-        // later sweep, once the log has gone quiet) records them.
-        if backfill::looks_active(path) {
-            n_live += 1;
-            continue;
+        // B3: change detection — skip re-parsing if the file hasn't changed.
+        //
+        // We need the session_id to look up stored meta, but we don't want to parse the full
+        // file just for the id. Read only the first non-empty line to extract sessionId cheaply.
+        let session_id_hint = peek_session_id(path);
+
+        if let Some(ref sid) = session_id_hint {
+            if let Ok(Some((stored_size, stored_mtime))) = storage::get_session_file_meta(sid) {
+                if let Some((current_size, current_mtime)) = composite_file_meta(path) {
+                    if current_size == stored_size && current_mtime == stored_mtime {
+                        n_unchanged += 1;
+                        continue; // Nothing changed — skip re-parse.
+                    }
+                }
+            }
         }
+
         if let Ok(Some(session)) = backfill::parse_session_log(path) {
             match backfill::backfill_session(&session, false) {
-                Ok(BackfillAction::Inserted) => n_new += 1,
-                Ok(BackfillAction::Replaced) => n_replaced += 1,
+                Ok(BackfillAction::Inserted) => {
+                    n_new += 1;
+                    update_file_meta_for_path(&session.session_id, path, &session.last_activity_at);
+                }
+                Ok(BackfillAction::Replaced) => {
+                    n_replaced += 1;
+                    update_file_meta_for_path(&session.session_id, path, &session.last_activity_at);
+                }
                 _ => {}
             }
         }
     }
 
-    if n_new + n_replaced > 0 {
-        eprintln!(
-            "trakr: reconciled {} new, {} replaced session(s) from logs",
-            n_new, n_replaced
-        );
-    }
-    if n_live > 0 {
-        eprintln!(
-            "trakr: left {} possibly-active session(s) alone (log written <24 h ago)",
-            n_live
-        );
-    }
+    let _ = (n_new, n_replaced, n_unchanged);
 
     Ok(())
+}
+
+/// Read only the first non-empty line of a JSONL file and extract the `sessionId` field.
+///
+/// Cheap enough to call in the reconciliation hot path — avoids a full file parse just to
+/// look up stored metadata.
+fn peek_session_id(path: &std::path::Path) -> Option<String> {
+    let f = std::fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(f);
+    use std::io::BufRead;
+    for line in reader.lines() {
+        let line = line.ok()?;
+        let line = line.trim();
+        if line.is_empty() { continue; }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+            if let Some(sid) = v.get("sessionId").and_then(|s| s.as_str()) {
+                return Some(sid.to_string());
+            }
+        }
+        break; // Only check the first non-empty line.
+    }
+    None
 }
 
 fn cmd_serve(api_port_override: Option<u16>, otel_port_override: Option<u16>) -> Result<()> {
@@ -1022,11 +1112,6 @@ fn cmd_serve(api_port_override: Option<u16>, otel_port_override: Option<u16>) ->
 
     storage::init_db()?;
 
-    // Reconcile any sessions whose SessionEnd hook was missed before starting the server.
-    if let Err(e) = run_log_reconciliation() {
-        eprintln!("trakr: reconciliation warning: {:#}", e);
-    }
-
     let rt = tokio::runtime::Runtime::new().context("creating tokio runtime")?;
     rt.block_on(async move {
         let costs = otel_receiver::new_session_costs();
@@ -1035,6 +1120,56 @@ fn cmd_serve(api_port_override: Option<u16>, otel_port_override: Option<u16>) ->
             costs: costs.clone(),
             budget_usd: cfg.monthly_budget_usd,
         };
+
+        // B3: spawn the reconciliation sweep as a background task.
+        // Runs once at startup and then every 30 s. Uses spawn_blocking because the sweep
+        // is synchronous / CPU-bound (file I/O + SQLite). No synthetic session_end is written
+        // so re-parsing a live session is harmless and self-healing.
+        tokio::spawn(async move {
+            loop {
+                let result = tokio::task::spawn_blocking(run_log_reconciliation).await;
+                match result {
+                    Ok(Err(e)) => eprintln!("trakr: reconciliation warning: {:#}", e),
+                    Err(e)    => eprintln!("trakr: reconciliation task panicked: {:#}", e),
+                    Ok(Ok(())) => {}
+                }
+                tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+            }
+        });
+
+        // C2: spawn the daily archive sweep as a background task.
+        // Runs once at startup and then every 24 h.  Uses spawn_blocking because
+        // run_archive_sweep is sync I/O.  Errors are logged but do not crash the server.
+        tokio::spawn(async {
+            loop {
+                let result = tokio::task::spawn_blocking(|| {
+                    let home = dirs::home_dir()
+                        .ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
+                    let projects_dir = home.join(".claude").join("projects");
+                    let archive_dir = home.join(".trakr").join("archive");
+                    if !projects_dir.exists() {
+                        return Ok(());
+                    }
+                    std::fs::create_dir_all(&archive_dir)
+                        .with_context(|| format!("creating archive dir {}", archive_dir.display()))?;
+                    let stats = archive::run_archive_sweep(&projects_dir, &archive_dir)?;
+                    if stats.copied > 0 {
+                        eprintln!(
+                            "trakr: archive sweep: {} file(s) copied ({} bytes), {} unchanged",
+                            stats.copied, stats.bytes_copied, stats.unchanged
+                        );
+                    }
+                    Ok::<(), anyhow::Error>(())
+                })
+                .await;
+                match result {
+                    Ok(Err(e)) => eprintln!("trakr: archive warning: {:#}", e),
+                    Err(e)    => eprintln!("trakr: archive task panicked: {:#}", e),
+                    Ok(Ok(())) => {}
+                }
+                tokio::time::sleep(tokio::time::Duration::from_secs(86_400)).await;
+            }
+        });
 
         tokio::join!(
             start_server(api_port, state),
@@ -1051,44 +1186,49 @@ fn cmd_spend() -> Result<()> {
     let cfg = config::load_config()?;
     let year_month = Utc::now().format("%Y-%m").to_string();
 
-    // Try the live API first; fall back to SQLite if the server isn't running.
-    let api_url = format!("http://127.0.0.1:{}/spend/monthly", cfg.api_port);
-    if let Some(body) = try_get(&api_url) {
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
-            let total    = json.get("spent_estimated_usd").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let budget   = json.get("budget_usd").and_then(|v| v.as_f64()).unwrap_or(cfg.monthly_budget_usd);
-            let period   = json.get("period").and_then(|v| v.as_str()).unwrap_or(&year_month);
-            let sources  = json.get("sources");
-            let completed_usd   = sources.and_then(|s| s.get("completed_sessions_usd")).and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let completed_count = sources.and_then(|s| s.get("completed_sessions_count")).and_then(|v| v.as_u64()).unwrap_or(0);
-            let active_usd      = sources.and_then(|s| s.get("active_sessions_usd")).and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let active_count    = sources.and_then(|s| s.get("active_sessions_count")).and_then(|v| v.as_u64());
-
-            println!("Spend  {}  (budget ${:.2})", period, budget);
-            println!("{}", "-".repeat(42));
-            println!("  {:<30} ${:>8.2}", format!("Completed sessions ({})", completed_count), completed_usd);
-            if active_usd > 0.0 {
-                // Older server binaries don't report the count — fall back to the bare label.
-                let label = match active_count {
-                    Some(n) => format!("Active sessions ({})", n),
-                    None => "Active sessions (live)".to_string(),
-                };
-                println!("  {:<30} ${:>8.2}", label, active_usd);
-            }
-            println!("{}", "-".repeat(42));
-            println!("  {:<30} ${:>8.2}", "Total", total);
-            return Ok(());
-        }
+    // B4: always use SQLite — no OTEL term, no live-API-vs-SQLite split.
+    // Run one inline incremental sweep before reading; sub-second when nothing changed
+    // because the change-detection logic skips unchanged sessions without a full re-parse.
+    storage::init_db()?;
+    if let Err(e) = run_log_reconciliation() {
+        eprintln!("trakr: reconciliation warning: {:#}", e);
     }
 
-    // Server not reachable — use SQLite.
     let (spent, count) = storage::get_monthly_spend_usd(&year_month)?;
-    println!("Spend  {}  (budget ${:.2})", year_month, cfg.monthly_budget_usd);
-    println!("{}", "-".repeat(42));
-    println!("  {:<30} ${:>8.2}", format!("Completed sessions ({})", count), spent);
-    println!("{}", "-".repeat(42));
-    println!("  {:<30} ${:>8.2}", "Total", spent);
-    println!("(trakr serve not running — active session costs not included)");
+    let now_local = chrono::Local::now();
+    let month_label = now_local.format("%B %Y").to_string();
+    let pct = if cfg.monthly_budget_usd > 0.0 { spent / cfg.monthly_budget_usd * 100.0 } else { 0.0 };
+    let day = now_local.day();
+    let suffix = match day % 100 {
+        11 | 12 | 13 => "th",
+        _ => match day % 10 { 1 => "st", 2 => "nd", 3 => "rd", _ => "th" },
+    };
+    let human_ts = format!("{}{} {} @ {} ({})",
+        day, suffix,
+        now_local.format("%B %Y"),
+        now_local.format("%H:%M:%S"),
+        now_local.format("%:z"),
+    );
+
+    // Value column is 10 chars. Monetary values right-aligned as $NNN.NN.
+    // Sessions (integer) is right-padded with 3 spaces so its units digit aligns
+    // with the units digit of monetary values (one column left of the decimal point).
+    const LW: usize = 12;
+    const VW: usize = 10;
+    const W: usize = 2 + LW + 1 + VW;
+    let sessions_val = format!("{:>width$}   ", count, width = VW - 3);
+    let cost_val     = format!("{:>width$}", format!("${:.2}", spent),                  width = VW);
+    let budget_val   = format!("{:>width$}", format!("${:.2}", cfg.monthly_budget_usd), width = VW);
+    let used_val     = format!("{:>width$}", format!("{:.1}%", pct),                    width = VW);
+
+    println!("Spend for {}", month_label);
+    println!("{}", "-".repeat(W));
+    println!("  {:<width$} {}", "Sessions", sessions_val, width = LW);
+    println!("  {:<width$} {}", "Cost",     cost_val,     width = LW);
+    println!("  {:<width$} {}", "Budget",   budget_val,   width = LW);
+    println!("  {:<width$} {}", "Used",     used_val,     width = LW);
+    println!("{}", "-".repeat(W));
+    println!("Last updated: {}", human_ts);
 
     Ok(())
 }
@@ -1102,10 +1242,104 @@ fn cmd_status() -> Result<()> {
     let mut problems: Vec<String> = Vec::new();
 
     let ok = |good: bool| if good { "✓" } else { "✗" };
+    // B4: info items are printed but never counted in problems.
+    let info = |_: bool| "ℹ";
 
-    // ── Claude Code settings ───────────────────────────────────────────────────
+    // ── Transcripts pipeline (health signals) ──────────────────────────────────
 
-    println!("Claude Code settings  (~/.claude/settings.json)");
+    println!("Transcripts pipeline  (primary health signal)");
+    println!("{}", "-".repeat(60));
+
+    let projects_dir = home.join(".claude").join("projects");
+    let projects_readable = projects_dir.exists()
+        && std::fs::read_dir(&projects_dir).is_ok();
+    println!("  {} {:<32} {}",
+        ok(projects_readable), "Claude projects dir",
+        if projects_readable {
+            projects_dir.display().to_string()
+        } else {
+            format!("{} (not readable)", projects_dir.display())
+        });
+    if !projects_readable {
+        problems.push(format!("Claude projects dir not readable: {}", projects_dir.display()));
+    }
+
+    let base = home.join(".trakr");
+    let db_path = base.join("trakr.db");
+    let db_summary = if db_path.exists() { storage::get_db_summary().ok().flatten() } else { None };
+    match &db_summary {
+        Some((earliest, latest, count)) => {
+            println!("  {} {:<32} {} sessions  ({} → {})", ok(true), "trakr.db",
+                count, earliest.format("%Y-%m-%d"), latest.format("%Y-%m-%d"));
+        }
+        None => {
+            println!("  {} {:<32} {}", ok(false), "trakr.db",
+                if db_path.exists() { "empty" } else { "missing — run `trakr init`" });
+            if !db_path.exists() {
+                problems.push("DB missing — run `trakr init`".to_string());
+            }
+        }
+    }
+
+    // DB freshness: compare newest transcript mtime vs newest DB last_activity_at.
+    if projects_readable && db_summary.is_some() {
+        let newest_transcript_mtime = find_newest_mtime(&projects_dir);
+        let newest_db_activity = storage::get_active_session_count(86400 * 7).ok(); // any in the last week
+        let _ = newest_db_activity; // used for display only
+        match newest_transcript_mtime {
+            Some(tm) => {
+                let age_mins = Utc::now().signed_duration_since(tm).num_minutes();
+                println!("  {} {:<32} newest transcript {} min ago",
+                    ok(age_mins < 120), "DB freshness",
+                    age_mins);
+            }
+            None => {
+                println!("  {} {:<32} no transcripts found", ok(false), "DB freshness");
+            }
+        }
+    }
+
+    // ── Storage ────────────────────────────────────────────────────────────────
+
+    println!();
+    println!("Storage  ({})", base.display());
+    println!("{}", "-".repeat(60));
+
+    let config_exists = config::config_path()?.exists();
+    println!("  {} {:<32} budget ${:.2}, api :{}, otel :{}{}",
+        ok(config_exists), "config.toml",
+        cfg.monthly_budget_usd, cfg.api_port, cfg.otel_port,
+        if config_exists { "" } else { "  (file missing — using defaults)" });
+
+    let transcripts_dir = base.join("transcripts");
+    let transcript_count = std::fs::read_dir(&transcripts_dir)
+        .map(|rd| rd.filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map_or(false, |x| x == "jsonl"))
+            .count())
+        .unwrap_or(0);
+    println!("  {} {:<32} {} archived", ok(transcripts_dir.exists()), "transcripts/", transcript_count);
+
+    // ── Server (informational) ─────────────────────────────────────────────────
+
+    println!();
+    println!("Server  (informational — spend does not depend on this)");
+    println!("{}", "-".repeat(60));
+
+    let plist_installed = launch_agent_plist_path().map(|p| p.exists()).unwrap_or(false);
+    println!("  {} {:<32} {}", info(plist_installed), "launchd service",
+        if plist_installed { LAUNCH_AGENT_LABEL } else { "not installed — run `trakr install-service`" });
+
+    let api_base = format!("http://127.0.0.1:{}", cfg.api_port);
+    let api_up = try_get(&format!("{}/spend/monthly", api_base)).is_some();
+    println!("  {} {:<32} {}", info(api_up), "API server",
+        if api_up { format!("{} (responding)", api_base) }
+        else { format!("{} not responding — run `trakr serve` (optional)", api_base) });
+    // B4: server not running is no longer a problem — spend works via SQLite alone.
+
+    // ── Claude Code settings (informational) ──────────────────────────────────
+
+    println!();
+    println!("Claude Code settings  (~/.claude/settings.json)  [informational]");
     println!("{}", "-".repeat(60));
 
     let settings: serde_json::Value = std::fs::read_to_string(home.join(".claude").join("settings.json"))
@@ -1133,121 +1367,30 @@ fn cmd_status() -> Result<()> {
         ("SessionEnd",   "trakr hook session-end"),
     ] {
         let installed = hook_installed(event, command);
-        println!("  {} {:<32} {}", ok(installed), format!("{} hook", event),
-            if installed { command } else { "not registered" });
-        if !installed {
-            problems.push(format!("{} hook missing — run `trakr init`", event));
-        }
+        println!("  {} {:<32} {}", info(installed), format!("{} hook", event),
+            if installed { command } else { "not registered (run `trakr init` to add)" });
+        // B4: hooks are informational — session_end hook is parked; spend uses transcripts.
     }
 
-    // Env vars Claude Code needs before it exports any telemetry.
+    // OTEL env vars — informational only.
     let env = settings.get("env");
-    let expected_env = [
+    let otel_port_str = format!("http://localhost:{}", cfg.otel_port);
+    let expected_env: &[(&str, &str)] = &[
         ("CLAUDE_CODE_ENABLE_TELEMETRY", "1"),
         ("OTEL_METRICS_EXPORTER",        "otlp"),
-        ("OTEL_EXPORTER_OTLP_ENDPOINT",  &format!("http://localhost:{}", cfg.otel_port)),
+        ("OTEL_EXPORTER_OTLP_ENDPOINT",  &otel_port_str),
         ("OTEL_EXPORTER_OTLP_PROTOCOL",  "http/json"),
     ];
-    for (key, expected) in &expected_env {
+    for (key, expected) in expected_env {
         let actual = env.and_then(|e| e.get(*key)).and_then(|v| v.as_str());
-        let good = actual == Some(expected);
+        let good = actual == Some(*expected);
         let shown = match actual {
             Some(v) if good => v.to_string(),
             Some(v) => format!("{}  (expected {})", v, expected),
             None => format!("not set  (expected {})", expected),
         };
-        println!("  {} {:<32} {}", ok(good), key, shown);
-        if !good {
-            problems.push(format!("{} — run `trakr init`, then restart Claude Code sessions", key));
-        }
-    }
-
-    // ── Storage ────────────────────────────────────────────────────────────────
-
-    let base = home.join(".trakr");
-    println!();
-    println!("Storage  ({})", base.display());
-    println!("{}", "-".repeat(60));
-
-    let db_path = base.join("trakr.db");
-    let db_summary = if db_path.exists() { storage::get_db_summary().ok().flatten() } else { None };
-    match &db_summary {
-        Some((earliest, latest, count)) => {
-            println!("  {} {:<32} {} sessions  ({} → {})", ok(true), "trakr.db",
-                count, earliest.format("%Y-%m-%d"), latest.format("%Y-%m-%d"));
-        }
-        None => {
-            println!("  {} {:<32} {}", ok(false), "trakr.db",
-                if db_path.exists() { "empty" } else { "missing — run `trakr init`" });
-            if !db_path.exists() {
-                problems.push("DB missing — run `trakr init`".to_string());
-            }
-        }
-    }
-
-    let config_exists = config::config_path()?.exists();
-    println!("  {} {:<32} budget ${:.2}, api :{}, otel :{}{}",
-        ok(config_exists), "config.toml",
-        cfg.monthly_budget_usd, cfg.api_port, cfg.otel_port,
-        if config_exists { "" } else { "  (file missing — using defaults)" });
-
-    let transcripts_dir = base.join("transcripts");
-    let transcript_count = std::fs::read_dir(&transcripts_dir)
-        .map(|rd| rd.filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().map_or(false, |x| x == "jsonl"))
-            .count())
-        .unwrap_or(0);
-    println!("  {} {:<32} {} archived", ok(transcripts_dir.exists()), "transcripts/", transcript_count);
-
-    // ── Server ─────────────────────────────────────────────────────────────────
-
-    println!();
-    println!("Server");
-    println!("{}", "-".repeat(60));
-
-    let plist_installed = launch_agent_plist_path().map(|p| p.exists()).unwrap_or(false);
-    println!("  {} {:<32} {}", ok(plist_installed), "launchd service",
-        if plist_installed { LAUNCH_AGENT_LABEL } else { "not installed — run `trakr install-service`" });
-
-    let api_base = format!("http://127.0.0.1:{}", cfg.api_port);
-    let api_up = try_get(&format!("{}/spend/monthly", api_base)).is_some();
-    println!("  {} {:<32} {}", ok(api_up), "API server",
-        if api_up { format!("{} (responding)", api_base) }
-        else { format!("{} not responding — run `trakr serve` or `trakr install-service`", api_base) });
-    if !api_up {
-        problems.push("API server not running".to_string());
-    }
-
-    // OTEL receiver health, as reported by the server's /status endpoint.
-    if let Some(body) = try_get(&format!("{}/status", api_base)) {
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
-            let otel = json.get("otel");
-            let batches = otel.and_then(|o| o.get("batches_received")).and_then(|v| v.as_u64()).unwrap_or(0);
-            let last = otel.and_then(|o| o.get("last_received")).and_then(|v| v.as_str());
-            let active = otel.and_then(|o| o.get("active_sessions")).and_then(|v| v.as_u64()).unwrap_or(0);
-            let active_usd = otel.and_then(|o| o.get("active_usd")).and_then(|v| v.as_f64()).unwrap_or(0.0);
-
-            let receiving = batches > 0;
-            let detail = if receiving {
-                format!("{} batches, {} active session(s), ${:.2}  (last: {})",
-                    batches, active, active_usd, last.unwrap_or("unknown"))
-            } else {
-                "no metrics received yet".to_string()
-            };
-            println!("  {} {:<32} {}", ok(receiving), "OTEL receiver", detail);
-            if !receiving {
-                problems.push(
-                    "OTEL receiver has never received metrics — check the env vars above, \
-                     then start a NEW Claude Code session (env changes don't apply to running sessions)"
-                        .to_string(),
-                );
-            }
-        }
-    } else if api_up {
-        // Old server binary without /status — restart picks up the new one.
-        println!("  {} {:<32} {}", ok(false), "OTEL receiver",
-            "server has no /status endpoint — restart it to pick up the new binary");
-        problems.push("server running an old binary — `trakr uninstall-service && trakr install-service`".to_string());
+        println!("  {} {:<32} {}", info(good), key, shown);
+        // B4: OTEL env vars are informational — not counted in problems.
     }
 
     // ── Summary ────────────────────────────────────────────────────────────────
@@ -1260,6 +1403,161 @@ fn cmd_status() -> Result<()> {
         for p in &problems {
             println!("  • {}", p);
         }
+    }
+
+    Ok(())
+}
+
+/// Walk `dir` recursively (depth 1 only for Claude projects) and return the most recent mtime.
+fn find_newest_mtime(projects_dir: &std::path::Path) -> Option<chrono::DateTime<Utc>> {
+    let mut newest: Option<chrono::DateTime<Utc>> = None;
+    let Ok(entries) = std::fs::read_dir(projects_dir) else { return None };
+    for entry in entries.filter_map(|e| e.ok()) {
+        let proj = entry.path();
+        if !proj.is_dir() { continue; }
+        let Ok(sub_entries) = std::fs::read_dir(&proj) else { continue };
+        for sub in sub_entries.filter_map(|e| e.ok()) {
+            let p = sub.path();
+            if p.extension().map_or(true, |e| e != "jsonl") { continue; }
+            if let Ok(meta) = std::fs::metadata(&p) {
+                if let Ok(mtime_sys) = meta.modified() {
+                    let mtime: chrono::DateTime<Utc> = mtime_sys.into();
+                    if newest.map_or(true, |n| mtime > n) {
+                        newest = Some(mtime);
+                    }
+                }
+            }
+        }
+    }
+    newest
+}
+
+/// Repair DB rows built by the old (over-counting) parser.
+///
+/// For every session whose transcript still exists under `~/.claude/projects/`
+/// or `~/.trakr/transcripts/`, deletes stale events and re-backfills from the
+/// transcript. Pass `--dry-run` to preview without writing. Default is to apply.
+///
+/// Sessions with no surviving transcript are left untouched; a count is printed.
+fn cmd_repair(dry_run: bool) -> Result<()> {
+
+    storage::init_db()?;
+
+    let home = dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
+    let projects_dir = home.join(".claude").join("projects");
+    let trakr_transcripts = home.join(".trakr").join("transcripts");
+
+    // Build a map from session_id → transcript path for every surviving file.
+    let mut transcript_index: std::collections::HashMap<String, std::path::PathBuf> =
+        std::collections::HashMap::new();
+
+    // Search ~/.claude/projects/<project>/<uuid>.jsonl
+    if projects_dir.exists() {
+        let log_paths = backfill::discover_sessions(&projects_dir, None, None)?;
+        for path in log_paths {
+            // Extract session_id from the file stem or first line.
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                // Try to get the real session_id from the file (stem may be the uuid but
+                // the internal sessionId is canonical).
+                let sid = peek_session_id(&path)
+                    .unwrap_or_else(|| stem.to_string());
+                transcript_index.insert(sid, path);
+            }
+        }
+    }
+
+    // Also search ~/.trakr/transcripts/<session_id>.jsonl (hook-archived copies).
+    if trakr_transcripts.exists() {
+        let Ok(entries) = std::fs::read_dir(&trakr_transcripts) else { /* skip */ return Ok(()) };
+        for entry in entries.filter_map(|e| e.ok()) {
+            let p = entry.path();
+            if p.extension().map_or(true, |e| e != "jsonl") { continue; }
+            if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                // Only add if not already found in projects_dir (prefer native path).
+                transcript_index.entry(stem.to_string()).or_insert(p);
+            }
+        }
+    }
+
+    // Load all sessions from the DB.
+    let db_sessions = storage::get_all_session_records()?;
+    let completed_ids = storage::get_completed_session_ids()?;
+
+    let mut to_rebuild: Vec<(String, std::path::PathBuf, bool)> = Vec::new();
+    let mut legacy_no_transcript = 0usize;
+
+    for record in &db_sessions {
+        let sid = &record.session_id;
+        let has_synthetic_end = completed_ids.contains(sid)
+            && record.source.as_deref() == Some("backfill");
+
+        if let Some(path) = transcript_index.get(sid) {
+            to_rebuild.push((sid.clone(), path.clone(), has_synthetic_end));
+        } else {
+            legacy_no_transcript += 1;
+        }
+    }
+
+    if dry_run {
+        println!("DRY RUN — no changes will be written.");
+        println!();
+        println!("{:<38}  {:<32}  has_synthetic_end",
+            "session_id", "transcript_path");
+        println!("{}", "-".repeat(95));
+        for (sid, path, synthetic) in &to_rebuild {
+            let path_str = path.display().to_string();
+            let short_path = if path_str.len() > 32 {
+                format!("...{}", &path_str[path_str.len() - 29..])
+            } else {
+                path_str
+            };
+            println!("{:<38}  {:<32}  {}",
+                if sid.len() > 38 { &sid[..38] } else { sid },
+                short_path,
+                if *synthetic { "yes" } else { "no" }
+            );
+        }
+        println!();
+        println!("{} session(s) to rebuild.", to_rebuild.len());
+        println!("{} session(s) retain legacy (inflated) figures — raw transcript lost.", legacy_no_transcript);
+    } else {
+        // --run: delete and re-backfill.
+        let mut n_rebuilt = 0usize;
+        let mut n_failed = 0usize;
+        for (sid, path, _) in &to_rebuild {
+            // Delete all events for this session.
+            if let Err(e) = storage::delete_events_for_session(sid) {
+                eprintln!("trakr repair: failed to delete events for {}: {}", &sid[..8.min(sid.len())], e);
+                n_failed += 1;
+                continue;
+            }
+            // Re-backfill from transcript.
+            match backfill::parse_session_log(path) {
+                Ok(Some(session)) => {
+                    match backfill::backfill_session(&session, false) {
+                        Ok(_) => {
+                            update_file_meta_for_path(&session.session_id, path, &session.last_activity_at);
+                            n_rebuilt += 1;
+                        }
+                        Err(e) => {
+                            eprintln!("trakr repair: backfill failed for {}: {}", &sid[..8.min(sid.len())], e);
+                            n_failed += 1;
+                        }
+                    }
+                }
+                Ok(None) => {
+                    eprintln!("trakr repair: could not parse transcript for {} (empty/no session_id)", &sid[..8.min(sid.len())]);
+                    n_failed += 1;
+                }
+                Err(e) => {
+                    eprintln!("trakr repair: parse error for {}: {}", &sid[..8.min(sid.len())], e);
+                    n_failed += 1;
+                }
+            }
+        }
+        println!("Repair complete: {} rebuilt, {} failed, {} with no transcript (left untouched).",
+            n_rebuilt, n_failed, legacy_no_transcript);
     }
 
     Ok(())
@@ -1486,6 +1784,34 @@ fn cmd_uninstall_service() -> Result<()> {
         .with_context(|| format!("removing plist at {}", plist_path.display()))?;
 
     println!("trakr: service stopped and removed");
+
+    Ok(())
+}
+
+/// Copy Claude transcripts from `~/.claude/projects/` into `~/.trakr/archive/` (incremental).
+///
+/// C1: Creates `~/.trakr/archive/` if it doesn't exist, then runs a single archive sweep.
+/// Files are mirrored by relative path; only new or changed files are copied.
+fn cmd_archive() -> Result<()> {
+    let home = dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
+    let projects_dir = home.join(".claude").join("projects");
+    let archive_dir = home.join(".trakr").join("archive");
+
+    if !projects_dir.exists() {
+        println!("No Claude projects directory found at {} — nothing to archive.", projects_dir.display());
+        return Ok(());
+    }
+
+    std::fs::create_dir_all(&archive_dir)
+        .with_context(|| format!("creating archive dir {}", archive_dir.display()))?;
+
+    let stats = archive::run_archive_sweep(&projects_dir, &archive_dir)?;
+
+    println!(
+        "Archive complete: {} file(s) copied ({} bytes), {} unchanged.",
+        stats.copied, stats.bytes_copied, stats.unchanged
+    );
 
     Ok(())
 }

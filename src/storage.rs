@@ -76,6 +76,10 @@ pub fn init_db() -> Result<()> {
     fs::create_dir_all(&transcripts)
         .with_context(|| format!("creating transcripts dir {}", transcripts.display()))?;
 
+    let archive = dir.join("archive");
+    fs::create_dir_all(&archive)
+        .with_context(|| format!("creating archive dir {}", archive.display()))?;
+
     let conn = open_db()?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS events (
@@ -147,6 +151,39 @@ fn run_migrations(conn: &Connection) -> Result<()> {
             "INSERT INTO schema_migrations (version, applied_at) VALUES (2, ?1)",
             rusqlite::params![Utc::now().to_rfc3339()],
         ).context("recording migration v2")?;
+    }
+
+    // v3 — add last_activity_at, file_size, file_mtime to sessions.
+    //
+    // `last_activity_at`: the timestamp of the last transcript event seen during backfill.
+    //   Distinct from `ended_at`, which is written only by the SessionEnd hook and records a
+    //   true observation of session end. `last_activity_at` is set by every reconciliation sweep
+    //   and is the basis for the "active session" display heuristic (within the last hour).
+    //
+    // `file_size` / `file_mtime`: the main-file metadata at the time of the last successful
+    //   parse. The reconciliation sweep uses these to skip re-parsing unchanged sessions.
+    if !applied.contains(&3) {
+        let existing_cols: std::collections::HashSet<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(sessions)")?;
+            let cols = stmt.query_map([], |row| row.get::<_, String>(1))?
+                .filter_map(|r| r.ok())
+                .collect();
+            cols
+        };
+        for col in &["last_activity_at", "file_mtime"] {
+            if !existing_cols.contains(*col) {
+                conn.execute_batch(&format!("ALTER TABLE sessions ADD COLUMN {} TEXT;", col))
+                    .with_context(|| format!("migration v3: adding column {}", col))?;
+            }
+        }
+        if !existing_cols.contains("file_size") {
+            conn.execute_batch("ALTER TABLE sessions ADD COLUMN file_size INTEGER;")
+                .context("migration v3: adding column file_size")?;
+        }
+        conn.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (3, ?1)",
+            rusqlite::params![Utc::now().to_rfc3339()],
+        ).context("recording migration v3")?;
     }
 
     Ok(())
@@ -268,76 +305,89 @@ pub fn get_completed_session_ids() -> Result<std::collections::HashSet<String>> 
     Ok(ids)
 }
 
-/// Compute the total estimated spend in USD for sessions that ended in the given year-month.
+/// Compute the total estimated spend in USD for sessions attributed to the given year-month.
 ///
-/// Uses the LAST `token_usage` event per session (cumulative counts — not a sum of all events).
+/// A session is attributed to a month by the timestamp of its **last** `token_usage` event.
+/// This means a session spanning a month boundary is counted entirely in the month of its
+/// last token_usage — an acceptable approximation noted here for clarity.
+///
+/// Cost is the **sum of all `token_usage` events** for each in-scope session (since Phase A
+/// backfill emits one `TokenUsage` per distinct model per session rather than a single
+/// cumulative total).
+///
+/// Sessions without a `session_end` are included: spend never keys on endings (invariant 3).
+///
 /// Returns `(total_usd, session_count)`.
 pub fn get_monthly_spend_usd(year_month: &str) -> Result<(f64, usize)> {
     use crate::cost::compute_cost_usd;
 
     let conn = open_db()?;
 
-    // Find sessions that ended this month.
-    let completed_this_month: Vec<String> = {
+    // Find sessions whose last `token_usage` event falls in the requested month.
+    // We do NOT filter on `session_end` — a session's tokens were spent whether or not
+    // it has ended.
+    let sessions_this_month: Vec<String> = {
         let mut stmt = conn.prepare(
-            "SELECT DISTINCT session_id FROM events \
-             WHERE event_type = 'session_end' \
-               AND strftime('%Y-%m', timestamp) = ?1",
+            "SELECT session_id \
+             FROM events \
+             WHERE event_type = 'token_usage' \
+             GROUP BY session_id \
+             HAVING strftime('%Y-%m', MAX(timestamp)) = ?1",
         )?;
         let rows = stmt
             .query_map(params![year_month], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()
-            .context("reading completed sessions this month")?;
+            .context("reading sessions with token_usage this month")?;
         rows
     };
 
-    if completed_this_month.is_empty() {
+    if sessions_this_month.is_empty() {
         return Ok((0.0, 0));
     }
 
     let mut total_usd = 0.0;
 
-    for session_id in &completed_this_month {
-        // Get the last token_usage payload for this session.
-        let payload: Option<String> = conn
-            .query_row(
-                "SELECT payload FROM events \
-                 WHERE session_id = ?1 AND event_type = 'token_usage' \
-                 ORDER BY id DESC LIMIT 1",
-                params![session_id],
-                |row| row.get(0),
-            )
-            .ok();
+    for session_id in &sessions_this_month {
+        // Sum every `token_usage` event for this session.
+        // Phase A produces one event per distinct model, so this is a genuine cross-model sum.
+        let mut stmt = conn.prepare(
+            "SELECT payload FROM events \
+             WHERE session_id = ?1 AND event_type = 'token_usage'",
+        )?;
+        let payloads: Vec<String> = stmt
+            .query_map(params![session_id], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()
+            .context("reading token_usage payloads")?;
 
-        let Some(payload) = payload else { continue };
-
-        let Ok(event) = serde_json::from_str::<crate::event::Event>(&payload) else { continue };
-
-        if let crate::event::Event::TokenUsage {
-            model,
-            input_tokens,
-            output_tokens,
-            cache_creation_input_tokens,
-            cache_read_input_tokens,
-            ..
-        } = event
-        {
-            total_usd += compute_cost_usd(
-                &model,
+        for payload in payloads {
+            let Ok(event) = serde_json::from_str::<crate::event::Event>(&payload) else { continue };
+            if let crate::event::Event::TokenUsage {
+                model,
                 input_tokens,
                 output_tokens,
                 cache_creation_input_tokens,
                 cache_read_input_tokens,
-            );
+                ..
+            } = event
+            {
+                total_usd += compute_cost_usd(
+                    &model,
+                    input_tokens,
+                    output_tokens,
+                    cache_creation_input_tokens,
+                    cache_read_input_tokens,
+                );
+            }
         }
     }
 
-    Ok((total_usd, completed_this_month.len()))
+    Ok((total_usd, sessions_this_month.len()))
 }
 
 /// Upsert project/timing/model/summary metadata for a session into the `sessions` table.
 ///
 /// Uses COALESCE so partial updates don't overwrite existing values with NULL.
+/// `last_activity_at` is always overwritten when non-null (not COALESCE'd) so it stays fresh.
 pub fn upsert_session_meta(
     session_id: &str,
     project_path: Option<&str>,
@@ -375,6 +425,50 @@ pub fn upsert_session_meta(
         ],
     )
     .context("upserting session metadata")?;
+    Ok(())
+}
+
+/// Upsert session metadata including `last_activity_at`.
+///
+/// This variant is used by the backfill path which always has a `last_activity_at` value.
+/// Keeping it separate from `upsert_session_meta` avoids changing the hook path's signature.
+pub fn upsert_session_meta_with_activity(
+    session_id: &str,
+    project_path: Option<&str>,
+    started_at: Option<DateTime<Utc>>,
+    model: Option<&str>,
+    source: Option<&str>,
+    title: Option<&str>,
+    summary: Option<&str>,
+    last_prompt: Option<&str>,
+    last_activity_at: &str,
+) -> Result<()> {
+    let conn = open_db()?;
+    conn.execute(
+        "INSERT INTO sessions (session_id, project_path, started_at, model, source, title, summary, last_prompt, last_activity_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         ON CONFLICT(session_id) DO UPDATE SET
+             project_path     = COALESCE(excluded.project_path,    sessions.project_path),
+             started_at       = COALESCE(excluded.started_at,      sessions.started_at),
+             model            = COALESCE(excluded.model,           sessions.model),
+             source           = COALESCE(excluded.source,          sessions.source),
+             title            = COALESCE(excluded.title,           sessions.title),
+             summary          = COALESCE(excluded.summary,         sessions.summary),
+             last_prompt      = COALESCE(excluded.last_prompt,     sessions.last_prompt),
+             last_activity_at = excluded.last_activity_at",
+        params![
+            session_id,
+            project_path,
+            started_at.map(|t| t.to_rfc3339()),
+            model,
+            source,
+            title,
+            summary,
+            last_prompt,
+            last_activity_at,
+        ],
+    )
+    .context("upserting session metadata with activity timestamp")?;
     Ok(())
 }
 
@@ -483,6 +577,94 @@ pub fn get_sessions() -> Result<Vec<(String, usize)>> {
         .context("reading session rows")?;
 
     Ok(rows)
+}
+
+/// Update the file metadata (size and mtime) stored for a session.
+///
+/// Called after a successful parse+replace so that the next reconciliation sweep can
+/// skip re-parsing unchanged files (B3 change detection).
+pub fn update_session_file_meta(
+    session_id: &str,
+    file_size: i64,
+    file_mtime: &str,
+    last_activity_at: Option<&str>,
+) -> Result<()> {
+    let conn = open_db()?;
+    conn.execute(
+        "UPDATE sessions SET file_size = ?1, file_mtime = ?2, last_activity_at = COALESCE(?3, last_activity_at) WHERE session_id = ?4",
+        rusqlite::params![file_size, file_mtime, last_activity_at, session_id],
+    )
+    .context("updating session file metadata")?;
+    Ok(())
+}
+
+/// Returns the stored (file_size, file_mtime) for a session, or None if not present.
+pub fn get_session_file_meta(session_id: &str) -> Result<Option<(i64, String)>> {
+    let conn = open_db()?;
+    let result: Option<(Option<i64>, Option<String>)> = conn.query_row(
+        "SELECT file_size, file_mtime FROM sessions WHERE session_id = ?1",
+        rusqlite::params![session_id],
+        |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<String>>(1)?)),
+    ).ok();
+    match result {
+        Some((Some(size), Some(mtime))) => Ok(Some((size, mtime))),
+        _ => Ok(None),
+    }
+}
+
+/// Returns the count of sessions whose `last_activity_at` is within the last `within_secs` seconds.
+///
+/// Used by the spend endpoint and CLI to display an "active sessions (N)" note.
+/// This is a display-only heuristic — spend does not depend on it.
+pub fn get_active_session_count(within_secs: i64) -> Result<usize> {
+    let conn = open_db()?;
+    let cutoff = (Utc::now() - chrono::Duration::seconds(within_secs)).to_rfc3339();
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sessions WHERE last_activity_at IS NOT NULL AND last_activity_at >= ?1",
+        rusqlite::params![cutoff],
+        |row| row.get(0),
+    ).context("querying active session count")?;
+    Ok(count as usize)
+}
+
+/// A record from the sessions table used for repair operations.
+pub struct SessionRecord {
+    pub session_id: String,
+    pub source: Option<String>,
+}
+
+/// Returns all sessions from the sessions table (id + source field).
+///
+/// Used by `trakr repair` to identify sessions with synthetic backfill data.
+pub fn get_all_session_records() -> Result<Vec<SessionRecord>> {
+    let conn = open_db()?;
+    let mut stmt = conn
+        .prepare("SELECT session_id, source FROM sessions ORDER BY session_id ASC")
+        .context("preparing session records query")?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(SessionRecord {
+                session_id: row.get::<_, String>(0)?,
+                source: row.get::<_, Option<String>>(1)?,
+            })
+        })
+        .context("querying session records")?
+        .collect::<Result<Vec<_>, _>>()
+        .context("reading session record rows")?;
+    Ok(rows)
+}
+
+/// Update the `last_activity_at` column for a session.
+///
+/// Called after a successful backfill so spend queries can find recently-active sessions.
+pub fn set_session_last_activity(session_id: &str, last_activity_at: &str) -> Result<()> {
+    let conn = open_db()?;
+    conn.execute(
+        "UPDATE sessions SET last_activity_at = ?1 WHERE session_id = ?2",
+        rusqlite::params![last_activity_at, session_id],
+    )
+    .context("setting session last_activity_at")?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -641,6 +823,47 @@ mod tests {
             insert_event("any_session", &Event::SessionEnd, Utc::now())?;
             let expected_db = tmp_path.join(".trakr").join("trakr.db");
             assert!(expected_db.exists(), "unified DB should exist at {:?}", expected_db);
+            Ok(())
+        })
+    }
+
+    // ── A4: spend without session_end ─────────────────────────────────────────
+
+    #[test]
+    fn spend_includes_session_without_session_end() -> Result<()> {
+        // A session that has token_usage events but NO session_end must still contribute
+        // to the monthly spend (invariant 3: spend never keys on endings).
+        let tmp = TempDir::new()?;
+        with_home(&tmp, || {
+            let session_id = "no_end_session";
+            let ts: chrono::DateTime<Utc> = "2026-06-15T10:00:00Z".parse().unwrap();
+
+            insert_event(
+                session_id,
+                &Event::SessionStart {
+                    model: "claude-sonnet-4-6".to_string(),
+                    source: "backfill".to_string(),
+                },
+                ts,
+            )?;
+            // 1M input @ $3/MTok = $3.00
+            insert_event(
+                session_id,
+                &Event::TokenUsage {
+                    model: "claude-sonnet-4-6".to_string(),
+                    input_tokens: 1_000_000,
+                    output_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                    total_tokens: 1_000_000,
+                },
+                ts,
+            )?;
+            // Deliberately omit SessionEnd.
+
+            let (spend, count) = get_monthly_spend_usd("2026-06")?;
+            assert_eq!(count, 1, "session without session_end should be counted");
+            assert!((spend - 3.0).abs() < 1e-9, "expected $3.00, got ${}", spend);
             Ok(())
         })
     }

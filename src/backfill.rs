@@ -16,35 +16,28 @@ pub struct BackfilledSession {
     /// Compact summary text from `isCompactSummary:true` user messages, truncated to 2000 chars.
     pub summary: Option<String>,
     pub last_prompt: Option<String>,
-}
-
-/// How long a session log must be untouched before backfill may treat the session
-/// as ended. A running session — even days old — writes to its log whenever it is
-/// used, so a fresh mtime means "probably still alive: never stamp a session_end".
-/// A wrong guess self-heals: the real SessionEnd hook replaces the record anyway.
-pub const ACTIVE_LOG_WINDOW: std::time::Duration =
-    std::time::Duration::from_secs(24 * 60 * 60);
-
-/// True if the log file was modified within [`ACTIVE_LOG_WINDOW`] — i.e. the
-/// session may still be running and must not be backfilled.
-pub fn looks_active(path: &Path) -> bool {
-    let Ok(meta) = std::fs::metadata(path) else { return false };
-    let Ok(mtime) = meta.modified() else { return false };
-    match mtime.elapsed() {
-        Ok(age) => age < ACTIVE_LOG_WINDOW,
-        // mtime in the future (clock skew) — err on the side of "alive".
-        Err(_) => true,
-    }
+    /// Timestamp of the last event seen in the transcript (main + subagent files).
+    ///
+    /// Written to `sessions.last_activity_at` on every successful backfill. This is the basis
+    /// for the "active session" display heuristic (within the last hour). It is distinct from
+    /// `sessions.ended_at`, which only the SessionEnd hook may set.
+    pub last_activity_at: DateTime<Utc>,
 }
 
 /// Outcome of attempting to backfill a single session.
 pub enum BackfillAction {
-    /// A `session_end` was already present in the DB — nothing changed.
-    Skipped,
     /// No prior data existed; all events were inserted.
     Inserted,
-    /// Partial data existed (no `session_end`); it was deleted and re-inserted.
+    /// Prior data existed; it was deleted and the new parse was inserted.
+    ///
+    /// B2: the old `Skipped` variant (which prevented re-parsing sessions that already had
+    /// both `session_start` + `session_end`) is removed. Every session is now always
+    /// re-parsed — idempotent via `replace_session`, and no synthetic `session_end` is written
+    /// so re-parsing a live session is harmless.
     Replaced,
+    /// Unused placeholder kept for forward compatibility — never returned.
+    #[allow(dead_code)]
+    Skipped,
 }
 
 /// Walk `projects_dir` and collect `.jsonl` files at depth 1 only.
@@ -155,19 +148,209 @@ fn truncate_chars(s: String, max_chars: usize) -> String {
     }
 }
 
-/// Parse a Claude Code native session log and reconstruct a `BackfilledSession`.
+/// Accumulates per-model token counts, deduplicating by `message.id`.
 ///
-/// Returns `Ok(None)` if the file is empty or no `sessionId` is found.
-/// Malformed JSON lines are silently skipped.
-pub fn parse_session_log(path: &Path) -> Result<Option<BackfilledSession>> {
+/// One API response may be written as multiple `assistant` JSONL lines (one per content
+/// block: thinking, text, tool_use) all repeating the same `usage` object. The first
+/// occurrence wins; duplicates are silently dropped. Entries with no `message.id`
+/// (rare; ~12 corpus-wide) are always counted — there is no key to dedupe on.
+struct PerModelAccumulator {
+    /// Total tokens per model name: (input, output, cache_creation, cache_read).
+    by_model: std::collections::HashMap<String, (u64, u64, u64, u64)>,
+    /// Set of `message.id` values already counted — prevents double-counting multi-block
+    /// API responses.
+    seen_message_ids: std::collections::HashSet<String>,
+}
+
+impl PerModelAccumulator {
+    fn new() -> Self {
+        Self {
+            by_model: std::collections::HashMap::new(),
+            seen_message_ids: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Attempt to accumulate usage from one `assistant` JSONL entry.
+    ///
+    /// Returns `true` if usage was counted, `false` if it was deduped.
+    fn accumulate(&mut self, message: &serde_json::Value) -> bool {
+        let model = message
+            .get("model")
+            .and_then(|v| v.as_str())
+            .filter(|m| !m.is_empty())
+            .unwrap_or("unknown")
+            .to_string();
+
+        let msg_id = message.get("id").and_then(|v| v.as_str()).map(|s| s.to_string());
+
+        // Dedupe: if we have a message id and have already seen it, skip.
+        if let Some(ref id) = msg_id {
+            if !self.seen_message_ids.insert(id.clone()) {
+                return false;
+            }
+        }
+
+        if let Some(usage) = message.get("usage") {
+            let input = usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+            let output = usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+            let cache_creation = usage
+                .get("cache_creation_input_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let cache_read = usage
+                .get("cache_read_input_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+
+            let entry = self.by_model.entry(model).or_insert((0, 0, 0, 0));
+            entry.0 += input;
+            entry.1 += output;
+            entry.2 += cache_creation;
+            entry.3 += cache_read;
+        }
+
+        true
+    }
+
+    /// Emit one `TokenUsage` event per distinct model, timestamped at `last_ts`.
+    ///
+    /// Returns the events and the model with the most output tokens (for `sessions.model`).
+    fn into_events(self, last_ts: DateTime<Utc>) -> (Vec<(DateTime<Utc>, Event)>, Option<String>) {
+        let mut usage_events = Vec::new();
+        let mut dominant_model: Option<String> = None;
+        let mut max_output: u64 = 0;
+
+        for (model, (input, output, cache_creation, cache_read)) in &self.by_model {
+            let total = input + output + cache_creation + cache_read;
+            usage_events.push((
+                last_ts,
+                Event::TokenUsage {
+                    model: model.clone(),
+                    input_tokens: *input,
+                    output_tokens: *output,
+                    cache_creation_input_tokens: *cache_creation,
+                    cache_read_input_tokens: *cache_read,
+                    total_tokens: total,
+                },
+            ));
+            if *output > max_output {
+                max_output = *output;
+                dominant_model = Some(model.clone());
+            }
+        }
+
+        // Sort by model name for deterministic output (useful in tests).
+        usage_events.sort_by(|(_, a), (_, b)| {
+            let model_a = if let Event::TokenUsage { model, .. } = a { model } else { "" };
+            let model_b = if let Event::TokenUsage { model, .. } = b { model } else { "" };
+            model_a.cmp(model_b)
+        });
+
+        (usage_events, dominant_model)
+    }
+}
+
+/// Parse assistant entries from a slice of JSONL lines, accumulating into `acc` and
+/// appending tool-use events to `tool_use_events`.
+fn parse_assistant_entries(
+    lines: &[serde_json::Value],
+    acc: &mut PerModelAccumulator,
+    tool_use_events: &mut Vec<(DateTime<Utc>, Event)>,
+) {
+    for entry in lines {
+        if entry.get("type").and_then(|v| v.as_str()) != Some("assistant") {
+            continue;
+        }
+        let Some(message) = entry.get("message") else { continue };
+        let ts = parse_timestamp(entry);
+
+        acc.accumulate(message);
+
+        if let Some(content) = message.get("content").and_then(|v| v.as_array()) {
+            for block in content {
+                if block.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
+                    let tool_name = block
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    tool_use_events.push((
+                        ts,
+                        Event::ToolUse {
+                            tool_name,
+                            status: "unknown".to_string(),
+                            duration_ms: None,
+                            error: None,
+                        },
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// Discover subagent JSONL files for a main session file.
+///
+/// Given a main file at `<dir>/<uuid>.jsonl`, looks for
+/// `<dir>/<uuid>/subagents/agent-*.jsonl`.
+///
+/// Public alias: `discover_subagent_files_pub` for callers outside this module
+/// (e.g. the reconciliation sweep in `main.rs`).
+fn discover_subagent_files(main_path: &Path) -> Vec<PathBuf> {
+    let Some(stem) = main_path.file_stem().and_then(|s| s.to_str()) else {
+        return Vec::new();
+    };
+    let Some(parent) = main_path.parent() else {
+        return Vec::new();
+    };
+    let subagents_dir = parent.join(stem).join("subagents");
+    if !subagents_dir.is_dir() {
+        return Vec::new();
+    }
+    let Ok(entries) = std::fs::read_dir(&subagents_dir) else {
+        return Vec::new();
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_file()
+                && p.extension().map_or(false, |ext| ext == "jsonl")
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map_or(false, |n| n.starts_with("agent-"))
+        })
+        .collect();
+    paths.sort();
+    paths
+}
+
+/// Public wrapper around `discover_subagent_files` for callers outside this module.
+pub fn discover_subagent_files_pub(main_path: &Path) -> Vec<PathBuf> {
+    discover_subagent_files(main_path)
+}
+
+/// Read and parse a JSONL file, returning only valid JSON lines.
+fn read_jsonl_lines(path: &Path) -> Result<Vec<serde_json::Value>> {
     let contents = std::fs::read_to_string(path)
         .with_context(|| format!("reading session log {}", path.display()))?;
-
-    let lines: Vec<serde_json::Value> = contents
+    let lines = contents
         .lines()
         .filter(|l| !l.trim().is_empty())
         .filter_map(|l| serde_json::from_str(l).ok())
         .collect();
+    Ok(lines)
+}
+
+/// Parse a Claude Code native session log and reconstruct a `BackfilledSession`.
+///
+/// Also discovers and includes any sibling subagent files at
+/// `<main_file_dir>/<session-uuid>/subagents/agent-*.jsonl`.
+///
+/// Returns `Ok(None)` if the file is empty or no `sessionId` is found.
+/// Malformed JSON lines are silently skipped.
+pub fn parse_session_log(path: &Path) -> Result<Option<BackfilledSession>> {
+    let lines = read_jsonl_lines(path)?;
 
     if lines.is_empty() {
         return Ok(None);
@@ -196,11 +379,9 @@ pub fn parse_session_log(path: &Path) -> Result<Option<BackfilledSession>> {
     let first_ts = parse_timestamp(lines.first().unwrap());
 
     let mut events: Vec<(DateTime<Utc>, Event)> = Vec::new();
-    let mut total_input: u64 = 0;
-    let mut total_output: u64 = 0;
-    let mut total_cache_creation: u64 = 0;
-    let mut total_cache_read: u64 = 0;
-    let mut model: Option<String> = None;
+    let mut acc = PerModelAccumulator::new();
+    // Dominant model for the first non-empty assistant entry (used for SessionStart).
+    let mut first_model: Option<String> = None;
     let mut last_ts = first_ts;
     let mut tool_use_events: Vec<(DateTime<Utc>, Event)> = Vec::new();
 
@@ -209,8 +390,12 @@ pub fn parse_session_log(path: &Path) -> Result<Option<BackfilledSession>> {
     let mut last_prompt: Option<String> = None;
 
     for entry in &lines {
-        let ts = parse_timestamp(entry);
-        last_ts = ts;
+        // Only advance last_ts when the entry actually carries a timestamp.
+        // Synthetic lines (ai-title, last-prompt) have no timestamp field;
+        // parse_timestamp would fall back to Utc::now() and corrupt the value.
+        if let Some(ts) = try_parse_timestamp(entry) {
+            last_ts = ts;
+        }
 
         let entry_type = entry.get("type").and_then(|v| v.as_str());
 
@@ -234,84 +419,69 @@ pub fn parse_session_log(path: &Path) -> Result<Option<BackfilledSession>> {
                     summary = text.map(|t| truncate_chars(t, 2000));
                 }
             }
-            Some("assistant") => {
-                let message = match entry.get("message") {
-                    Some(m) => m,
-                    None => continue,
-                };
+            _ => {}
+        }
 
-                if model.is_none() {
+        // Capture first model seen for SessionStart display.
+        if entry_type == Some("assistant") {
+            if first_model.is_none() {
+                if let Some(message) = entry.get("message") {
                     if let Some(m) = message.get("model").and_then(|v| v.as_str()) {
                         if !m.is_empty() {
-                            model = Some(m.to_string());
-                        }
-                    }
-                }
-
-                if let Some(usage) = message.get("usage") {
-                    total_input +=
-                        usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                    total_output +=
-                        usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                    total_cache_creation += usage
-                        .get("cache_creation_input_tokens")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0);
-                    total_cache_read += usage
-                        .get("cache_read_input_tokens")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0);
-                }
-
-                if let Some(content) = message.get("content").and_then(|v| v.as_array()) {
-                    for block in content {
-                        if block.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
-                            let tool_name = block
-                                .get("name")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("unknown")
-                                .to_string();
-                            tool_use_events.push((
-                                ts,
-                                Event::ToolUse {
-                                    tool_name,
-                                    status: "unknown".to_string(),
-                                    duration_ms: None,
-                                    error: None,
-                                },
-                            ));
+                            first_model = Some(m.to_string());
                         }
                     }
                 }
             }
-            _ => {}
         }
     }
 
-    let final_model = model.unwrap_or_else(|| "unknown".to_string());
+    // Process assistant entries from main file (A1 + A2: deduped per-model accumulation).
+    parse_assistant_entries(&lines, &mut acc, &mut tool_use_events);
 
+    // A3: also parse any sibling subagent files — same sessionId, same dedupe set.
+    let subagent_files = discover_subagent_files(path);
+    for sub_path in &subagent_files {
+        match read_jsonl_lines(sub_path) {
+            Ok(sub_lines) => {
+                // Update last_ts if subagent file extends the timeline.
+                // Walk backwards to find the last entry that actually carries a timestamp.
+                if let Some(sub_last) = sub_lines.iter().rev().find_map(try_parse_timestamp) {
+                    if sub_last > last_ts {
+                        last_ts = sub_last;
+                    }
+                }
+                parse_assistant_entries(&sub_lines, &mut acc, &mut tool_use_events);
+            }
+            Err(e) => {
+                eprintln!(
+                    "trakr: skipping subagent file {}: {}",
+                    sub_path.display(),
+                    e
+                );
+            }
+        }
+    }
+
+    let (usage_events, dominant_model) = acc.into_events(last_ts);
+
+    // Use dominant model (most output tokens) for SessionStart; fall back to first seen.
+    let session_model = dominant_model
+        .or(first_model)
+        .unwrap_or_else(|| "unknown".to_string());
+
+    // B1: backfill never fabricates a session_end.  The event stream is:
+    //   SessionStart { source: "backfill" }, tool uses, per-model token usages.
+    // Only the real SessionEnd hook (which observed the true ending) may write one.
     events.push((
         first_ts,
         Event::SessionStart {
-            model: final_model.clone(),
+            model: session_model,
             source: "backfill".to_string(),
         },
     ));
     events.extend(tool_use_events);
-
-    let total_tokens = total_input + total_output + total_cache_creation + total_cache_read;
-    events.push((
-        last_ts,
-        Event::TokenUsage {
-            model: final_model,
-            input_tokens: total_input,
-            output_tokens: total_output,
-            cache_creation_input_tokens: total_cache_creation,
-            cache_read_input_tokens: total_cache_read,
-            total_tokens,
-        },
-    ));
-    events.push((last_ts, Event::SessionEnd));
+    events.extend(usage_events);
 
     Ok(Some(BackfilledSession {
         session_id,
@@ -321,22 +491,19 @@ pub fn parse_session_log(path: &Path) -> Result<Option<BackfilledSession>> {
         title,
         summary,
         last_prompt,
+        last_activity_at: last_ts,
     }))
 }
 
 /// Decide whether to skip, insert, or replace a session, then act accordingly.
 ///
 /// Also archives the native Claude transcript and populates summary fields.
-/// A session is skipped only if it is fully tracked (has both session_start and session_end).
+///
+/// B1: A session is **never** skipped due to having a `session_end` in the DB — only the
+/// SessionEnd hook produces genuine endings, and re-parsing is idempotent via `replace_session`.
+/// The skip path is intentionally removed; every session found in the transcript is (re-)parsed.
 pub fn backfill_session(session: &BackfilledSession, dry_run: bool) -> Result<BackfillAction> {
     storage::init_db()?;
-
-    let started = storage::get_started_session_ids()?;
-    let completed = storage::get_completed_session_ids()?;
-
-    if started.contains(&session.session_id) && completed.contains(&session.session_id) {
-        return Ok(BackfillAction::Skipped);
-    }
 
     let existing = storage::get_events(Some(&session.session_id))?;
     let action = if existing.is_empty() {
@@ -347,11 +514,13 @@ pub fn backfill_session(session: &BackfilledSession, dry_run: bool) -> Result<Ba
 
     if !dry_run {
         storage::replace_session(&session.session_id, &session.events)?;
-        storage::upsert_session_meta(
+        let last_activity_str = session.last_activity_at.to_rfc3339();
+        // Use the variant that always writes last_activity_at (not COALESCE'd).
+        storage::upsert_session_meta_with_activity(
             &session.session_id,
             session.project_path.as_deref(),
             session.events.first().map(|(ts, _)| *ts),
-            session.events.last().map(|(ts, _)| *ts),
+            // ended_at is omitted — only the SessionEnd hook sets a true ending timestamp (invariant 1).
             session.events.iter().find_map(|(_, e)| {
                 if let Event::SessionStart { model, .. } = e {
                     if model != "unknown" { Some(model.as_str()) } else { None }
@@ -363,6 +532,7 @@ pub fn backfill_session(session: &BackfilledSession, dry_run: bool) -> Result<Ba
             session.title.as_deref(),
             session.summary.as_deref(),
             session.last_prompt.as_deref(),
+            &last_activity_str,
         )?;
         if let Err(e) = storage::archive_transcript(&session.session_id, &session.source_path) {
             eprintln!("trakr: failed to archive transcript for {}: {}", &session.session_id[..8.min(session.session_id.len())], e);
@@ -517,13 +687,16 @@ pub fn inspect_logs(
 
 /// Parse an ISO 8601 timestamp from a JSON entry's `timestamp` field.
 /// Falls back to `Utc::now()` if missing or unparseable.
-fn parse_timestamp(entry: &serde_json::Value) -> DateTime<Utc> {
+fn try_parse_timestamp(entry: &serde_json::Value) -> Option<DateTime<Utc>> {
     entry
         .get("timestamp")
         .and_then(|v| v.as_str())
         .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
         .map(|dt| dt.with_timezone(&Utc))
-        .unwrap_or_else(Utc::now)
+}
+
+fn parse_timestamp(entry: &serde_json::Value) -> DateTime<Utc> {
+    try_parse_timestamp(entry).unwrap_or_else(Utc::now)
 }
 
 #[cfg(test)]
@@ -552,32 +725,6 @@ mod tests {
         let mut f = std::fs::File::create(&path).unwrap();
         f.write_all(content.as_bytes()).unwrap();
         path
-    }
-
-    // ── looks_active tests ────────────────────────────────────────────────────
-
-    #[test]
-    fn test_looks_active_fresh_log() -> Result<()> {
-        let tmp = TempDir::new()?;
-        let path = write_jsonl(&tmp, "fresh.jsonl", "{}");
-        assert!(looks_active(&path), "just-written log should look active");
-        Ok(())
-    }
-
-    #[test]
-    fn test_looks_active_old_log() -> Result<()> {
-        let tmp = TempDir::new()?;
-        let path = write_jsonl(&tmp, "old.jsonl", "{}");
-        let old_mtime = std::time::SystemTime::now() - (ACTIVE_LOG_WINDOW * 2);
-        let f = std::fs::File::options().write(true).open(&path)?;
-        f.set_times(std::fs::FileTimes::new().set_modified(old_mtime))?;
-        assert!(!looks_active(&path), "log untouched for 2× the window should not look active");
-        Ok(())
-    }
-
-    #[test]
-    fn test_looks_active_missing_file() {
-        assert!(!looks_active(Path::new("/nonexistent/never.jsonl")));
     }
 
     // ── parse_session_log tests ───────────────────────────────────────────────
@@ -737,6 +884,151 @@ mod tests {
         Ok(())
     }
 
+    // ── A1: dedupe by message.id ──────────────────────────────────────────────
+
+    #[test]
+    fn test_dedupe_by_message_id() -> Result<()> {
+        // One API call emits 3 assistant JSONL lines (thinking, text, tool_use) — each
+        // carries the same message.id and identical usage.  Usage should be counted once.
+        let tmp = TempDir::new()?;
+        let content = r#"{"type":"system","sessionId":"dedup1","timestamp":"2026-01-01T10:00:00Z"}
+{"type":"assistant","sessionId":"dedup1","timestamp":"2026-01-01T10:01:00Z","message":{"id":"msg_abc","model":"claude-sonnet-4-6","content":[{"type":"thinking","thinking":"..."}],"usage":{"input_tokens":100,"output_tokens":50,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}
+{"type":"assistant","sessionId":"dedup1","timestamp":"2026-01-01T10:01:00Z","message":{"id":"msg_abc","model":"claude-sonnet-4-6","content":[{"type":"text","text":"hello"}],"usage":{"input_tokens":100,"output_tokens":50,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}
+{"type":"assistant","sessionId":"dedup1","timestamp":"2026-01-01T10:01:00Z","message":{"id":"msg_abc","model":"claude-sonnet-4-6","content":[{"type":"tool_use","name":"bash"}],"usage":{"input_tokens":100,"output_tokens":50,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}
+"#;
+        let path = write_jsonl(&tmp, "dedup1.jsonl", content);
+        let session = parse_session_log(&path)?.expect("should parse");
+
+        let usage_events: Vec<&Event> = session
+            .events
+            .iter()
+            .map(|(_, e)| e)
+            .filter(|e| matches!(e, Event::TokenUsage { .. }))
+            .collect();
+
+        assert_eq!(usage_events.len(), 1, "one model → one TokenUsage event");
+
+        if let Event::TokenUsage { input_tokens, output_tokens, .. } = usage_events[0] {
+            // Only counted once despite 3 lines with the same message.id
+            assert_eq!(*input_tokens, 100, "input counted once (not 3×)");
+            assert_eq!(*output_tokens, 50, "output counted once (not 3×)");
+        }
+        Ok(())
+    }
+
+    // ── A2: per-model usage ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_per_model_usage() -> Result<()> {
+        // Two distinct models in one session → two separate TokenUsage events.
+        let tmp = TempDir::new()?;
+        let content = r#"{"type":"system","sessionId":"multimodel1","timestamp":"2026-01-01T10:00:00Z"}
+{"type":"assistant","sessionId":"multimodel1","timestamp":"2026-01-01T10:01:00Z","message":{"id":"msg_s1","model":"claude-sonnet-4-6","content":[],"usage":{"input_tokens":1000000,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}
+{"type":"assistant","sessionId":"multimodel1","timestamp":"2026-01-01T10:02:00Z","message":{"id":"msg_h1","model":"claude-haiku-4-5","content":[],"usage":{"input_tokens":0,"output_tokens":1000000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}
+"#;
+        let path = write_jsonl(&tmp, "multimodel1.jsonl", content);
+        let session = parse_session_log(&path)?.expect("should parse");
+
+        let usage_events: Vec<&Event> = session
+            .events
+            .iter()
+            .map(|(_, e)| e)
+            .filter(|e| matches!(e, Event::TokenUsage { .. }))
+            .collect();
+
+        assert_eq!(usage_events.len(), 2, "two models → two TokenUsage events");
+
+        // Check that each model appears exactly once with the correct counts.
+        let mut saw_sonnet = false;
+        let mut saw_haiku = false;
+        for event in &usage_events {
+            if let Event::TokenUsage { model, input_tokens, output_tokens, .. } = event {
+                if model.contains("sonnet") {
+                    assert_eq!(*input_tokens, 1_000_000);
+                    assert_eq!(*output_tokens, 0);
+                    saw_sonnet = true;
+                } else if model.contains("haiku") {
+                    assert_eq!(*input_tokens, 0);
+                    assert_eq!(*output_tokens, 1_000_000);
+                    saw_haiku = true;
+                }
+            }
+        }
+        assert!(saw_sonnet, "expected a sonnet TokenUsage event");
+        assert!(saw_haiku, "expected a haiku TokenUsage event");
+
+        // Verify spend = sum of both at correct rates:
+        //   sonnet: 1M input @ $3/MTok = $3.00
+        //   haiku: 1M output @ $5/MTok = $5.00
+        //   total = $8.00
+        let total_cost: f64 = usage_events.iter().filter_map(|e| {
+            if let Event::TokenUsage { model, input_tokens, output_tokens,
+                cache_creation_input_tokens, cache_read_input_tokens, .. } = e {
+                Some(crate::cost::compute_cost_usd(
+                    model, *input_tokens, *output_tokens,
+                    *cache_creation_input_tokens, *cache_read_input_tokens,
+                ))
+            } else {
+                None
+            }
+        }).sum();
+        assert!((total_cost - 8.0).abs() < 1e-9, "expected $8.00 total, got ${}", total_cost);
+        Ok(())
+    }
+
+    // ── A3: subagent transcripts ──────────────────────────────────────────────
+
+    #[test]
+    fn test_subagent_usage_included() -> Result<()> {
+        // Main file + a sibling subagent file → usage and tool uses from both appear.
+        let tmp = TempDir::new()?;
+        let main_uuid = "a1b2c3d4-dead-beef-cafe-000000000001";
+
+        // Write main session file.
+        let main_content = format!(
+            r#"{{"type":"system","sessionId":"{uuid}","timestamp":"2026-01-01T10:00:00Z"}}
+{{"type":"assistant","sessionId":"{uuid}","timestamp":"2026-01-01T10:01:00Z","message":{{"id":"msg_main1","model":"claude-sonnet-4-6","content":[{{"type":"tool_use","name":"bash"}}],"usage":{{"input_tokens":100,"output_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}}}}
+"#,
+            uuid = main_uuid
+        );
+        let project_dir = tmp.path().join("my-project");
+        std::fs::create_dir_all(&project_dir)?;
+        let main_path = project_dir.join(format!("{}.jsonl", main_uuid));
+        std::fs::write(&main_path, main_content.as_bytes())?;
+
+        // Write subagent file.
+        let subagents_dir = project_dir.join(main_uuid).join("subagents");
+        std::fs::create_dir_all(&subagents_dir)?;
+        let sub_content = format!(
+            r#"{{"type":"assistant","sessionId":"{uuid}","isSidechain":true,"timestamp":"2026-01-01T10:02:00Z","message":{{"id":"msg_sub1","model":"claude-haiku-4-5","content":[{{"type":"tool_use","name":"read"}}],"usage":{{"input_tokens":50,"output_tokens":20,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}}}}
+"#,
+            uuid = main_uuid
+        );
+        let sub_path = subagents_dir.join("agent-sub1.jsonl");
+        std::fs::write(&sub_path, sub_content.as_bytes())?;
+
+        let session = parse_session_log(&main_path)?.expect("should parse");
+
+        // Should have two TokenUsage events — one per model.
+        let usage_events: Vec<&Event> = session
+            .events
+            .iter()
+            .map(|(_, e)| e)
+            .filter(|e| matches!(e, Event::TokenUsage { .. }))
+            .collect();
+        assert_eq!(usage_events.len(), 2, "main + subagent → two TokenUsage events (one per model)");
+
+        // Should have two ToolUse events — bash from main, read from subagent.
+        let tool_uses: Vec<&str> = session
+            .events
+            .iter()
+            .filter_map(|(_, e)| if let Event::ToolUse { tool_name, .. } = e { Some(tool_name.as_str()) } else { None })
+            .collect();
+        assert!(tool_uses.contains(&"bash"), "bash from main file");
+        assert!(tool_uses.contains(&"read"), "read from subagent file");
+        Ok(())
+    }
+
     // ── backfill_session tests ────────────────────────────────────────────────
 
     fn make_session(id: &str) -> BackfilledSession {
@@ -745,6 +1037,7 @@ mod tests {
             session_id: id.to_string(),
             project_path: None,
             source_path: PathBuf::new(), // non-existent — archive_transcript no-ops
+            // B1: no SessionEnd in the backfilled stream — invariant 1.
             events: vec![
                 (ts, Event::SessionStart { model: "test-model".to_string(), source: "backfill".to_string() }),
                 (ts, Event::TokenUsage {
@@ -755,18 +1048,23 @@ mod tests {
                     cache_read_input_tokens: 0,
                     total_tokens: 15,
                 }),
-                (ts, Event::SessionEnd),
             ],
             title: None,
             summary: None,
             last_prompt: None,
+            last_activity_at: ts,
         }
     }
 
+    // B1: backfill never skips a session that already has session_start + session_end in the DB.
+    // Previously, `backfill_session` had a `Skipped` path for sessions with both events;
+    // that path is now removed (B2). Sessions already in the DB are always `Replaced` so that
+    // a re-run of the corrected parser self-heals inflated figures.
     #[test]
-    fn test_backfill_session_skip_when_complete() -> Result<()> {
+    fn test_backfill_session_replaces_even_when_complete() -> Result<()> {
         let tmp = TempDir::new()?;
         with_home(&tmp, || {
+            // Pre-populate a session with session_start + session_end (old behaviour / hook path).
             storage::insert_event(
                 "complete_session",
                 &Event::SessionStart { model: "m".to_string(), source: "hook".to_string() },
@@ -774,9 +1072,17 @@ mod tests {
             )?;
             storage::insert_event("complete_session", &Event::SessionEnd, Utc::now())?;
 
+            // B1/B2: should no longer skip — returns Replaced, not Skipped.
             let session = make_session("complete_session");
             let action = backfill_session(&session, false)?;
-            assert!(matches!(action, BackfillAction::Skipped));
+            assert!(matches!(action, BackfillAction::Replaced),
+                "backfill should replace even sessions that had a session_end (B2: skip path removed)");
+
+            // After replace the DB has the clean backfilled set (no session_end from backfill).
+            let events = storage::get_events(Some("complete_session"))?;
+            assert_eq!(events.len(), 2, "should have 2 events (start + token_usage, no session_end)");
+            let has_session_end = events.iter().any(|(_, _, e)| matches!(e, Event::SessionEnd));
+            assert!(!has_session_end, "backfill must not write session_end (invariant 1)");
             Ok(())
         })
     }
@@ -792,7 +1098,7 @@ mod tests {
             assert!(matches!(action, BackfillAction::Replaced));
 
             let events = storage::get_events(Some("tail_only_session"))?;
-            assert_eq!(events.len(), 3, "should have full backfilled set");
+            assert_eq!(events.len(), 2, "should have 2 backfilled events (start + token_usage)");
             Ok(())
         })
     }
@@ -806,7 +1112,7 @@ mod tests {
             assert!(matches!(action, BackfillAction::Inserted));
 
             let events = storage::get_events(Some("new_session"))?;
-            assert_eq!(events.len(), 3, "all events should be inserted");
+            assert_eq!(events.len(), 2, "all events should be inserted (start + token_usage)");
             Ok(())
         })
     }
@@ -826,7 +1132,7 @@ mod tests {
             assert!(matches!(action, BackfillAction::Replaced));
 
             let events = storage::get_events(Some("partial_session"))?;
-            assert_eq!(events.len(), 3, "should have 3 events after replace");
+            assert_eq!(events.len(), 2, "should have 2 events after replace");
             Ok(())
         })
     }
@@ -841,6 +1147,112 @@ mod tests {
 
             let events = storage::get_events(Some("dry_run_session"))?;
             assert!(events.is_empty(), "dry_run should not write anything");
+            Ok(())
+        })
+    }
+
+    // ── B1: backfill never writes session_end ─────────────────────────────────
+
+    #[test]
+    fn test_no_session_end_from_backfill() -> Result<()> {
+        // B1: parse_session_log must not emit a SessionEnd event, regardless of file content.
+        let tmp = TempDir::new()?;
+        let content = r#"{"type":"system","sessionId":"b1test","timestamp":"2026-01-01T10:00:00Z"}
+{"type":"assistant","sessionId":"b1test","timestamp":"2026-01-01T10:01:00Z","message":{"id":"msg1","model":"claude-sonnet-4-6","content":[],"usage":{"input_tokens":100,"output_tokens":50,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}
+"#;
+        let path = write_jsonl(&tmp, "b1test.jsonl", content);
+        let session = parse_session_log(&path)?.expect("should parse");
+
+        let has_session_end = session.events.iter().any(|(_, e)| matches!(e, Event::SessionEnd));
+        assert!(!has_session_end,
+            "backfill must never emit SessionEnd (invariant 1 / B1)");
+
+        let has_session_start = session.events.iter().any(|(_, e)| matches!(e, Event::SessionStart { .. }));
+        assert!(has_session_start, "should have SessionStart");
+
+        let has_token_usage = session.events.iter().any(|(_, e)| matches!(e, Event::TokenUsage { .. }));
+        assert!(has_token_usage, "should have TokenUsage");
+
+        Ok(())
+    }
+
+    // ── B6: active display rule ───────────────────────────────────────────────
+
+    // ── B6: active display rule ───────────────────────────────────────────────
+
+    #[test]
+    fn test_active_display_rule() -> Result<()> {
+        use chrono::Duration;
+
+        let tmp = TempDir::new()?;
+        with_home(&tmp, || {
+            storage::init_db()?;
+
+            // Session 1: last_activity_at = now - 10 minutes → should be counted as active.
+            let recently_active = (Utc::now() - Duration::minutes(10)).to_rfc3339();
+            storage::upsert_session_meta_with_activity(
+                "active_session", None, None, None, Some("backfill"),
+                None, None, None, &recently_active,
+            )?;
+
+            // Session 2: last_activity_at = now - 3 hours → should NOT be counted.
+            let stale = (Utc::now() - Duration::hours(3)).to_rfc3339();
+            storage::upsert_session_meta_with_activity(
+                "stale_session", None, None, None, Some("backfill"),
+                None, None, None, &stale,
+            )?;
+
+            let active = storage::get_active_session_count(3600)?; // within the last hour
+            assert_eq!(active, 1, "only the recently-active session (10 min) should count");
+
+            Ok(())
+        })
+    }
+
+    // ── B6: change detection ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_change_detection_skips_unchanged_session() -> Result<()> {
+        // When stored (file_size, file_mtime) match the actual file, get_session_file_meta
+        // should return the same values, and the reconciliation logic would skip re-parsing.
+        // We test the storage layer: write meta, read it back, confirm it matches.
+        let tmp = TempDir::new()?;
+        with_home(&tmp, || {
+            storage::init_db()?;
+
+            // Create a JSONL file.
+            let path = write_jsonl(&tmp, "change_detect.jsonl",
+                r#"{"type":"system","sessionId":"cd_test","timestamp":"2026-01-01T10:00:00Z"}"#);
+
+            // Record the file's metadata.
+            let meta = std::fs::metadata(&path)?;
+            let size = meta.len() as i64;
+            let mtime_sys = meta.modified()?;
+            let mtime: chrono::DateTime<Utc> = mtime_sys.into();
+            let mtime_str = mtime.to_rfc3339();
+
+            // Create the sessions row and store file meta.
+            storage::upsert_session_meta_with_activity(
+                "cd_test", None, None, None, Some("backfill"),
+                None, None, None, &Utc::now().to_rfc3339(),
+            )?;
+            storage::update_session_file_meta("cd_test", size, &mtime_str, None)?;
+
+            // Read it back and verify it matches.
+            let stored = storage::get_session_file_meta("cd_test")?
+                .expect("should have stored meta");
+
+            assert_eq!(stored.0, size, "stored file_size should match actual");
+            assert_eq!(stored.1, mtime_str, "stored file_mtime should match actual");
+
+            // Simulate the change-detection check: if stored == actual, we would skip.
+            let current_size = std::fs::metadata(&path)?.len() as i64;
+            let current_mtime: chrono::DateTime<Utc> = std::fs::metadata(&path)?.modified()?.into();
+            let current_mtime_str = current_mtime.to_rfc3339();
+
+            let would_skip = current_size == stored.0 && current_mtime_str == stored.1;
+            assert!(would_skip, "unchanged file should be detected as unchanged and skipped");
+
             Ok(())
         })
     }

@@ -1,3 +1,4 @@
+pub mod archive;
 pub mod backfill;
 pub mod config;
 pub mod cost;

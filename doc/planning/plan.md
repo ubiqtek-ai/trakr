@@ -1,9 +1,9 @@
 # Implementation Plan
 
 ## ── WHAT'S NEXT ──────────────────────────────────────────────────────────
-**Next:** Phase A — Single-ledger parser correctness (dedupe, per-model pricing, subagents, spend query)
-**Sub-doc:** `planning/single-ledger-plan.md`
-**Blockers:** None — execution plan is complete and self-contained; hand to Sonnet agent or implement directly
+**Next:** Run `trakr repair --run` to rebuild spend from corrected transcripts, then Action 4d.3 (title/summary in list/show)
+**Sub-doc:** (none)
+**Blockers:** Repair run requires Jim to execute manually (see last checkpoint)
 ─────────────────────────────────────────────────────────────────────────────
 
 ## Phase 1: Project Foundation
@@ -64,6 +64,7 @@
 - ✓ DONE - SessionCosts type: Arc<Mutex<HashMap<session_id, f64>>> shared with API server
 - ✓ DONE - Unit tests for attribute extraction, accumulation, fallback behaviour (5 tests)
 - NOTE: requires OTEL_EXPORTER_OTLP_PROTOCOL=http/json — protobuf not supported in v1
+- **[superseded by single-ledger plan]** — OTEL is now informational only; transcripts are the single spend source
 
 ### Action 3.4: HTTP API server
 - ✓ DONE - src/server.rs — axum HTTP server (port 8787 by default)
@@ -71,6 +72,7 @@
 - ✓ DONE - Response: period, spent_estimated_usd, budget_usd, sources breakdown, note label
 - ✓ DONE - ctx-trakr serve subcommand — starts server + OTEL receiver via tokio::runtime (sync CLI unaffected)
 - ✓ DONE - ctx-trakr spend subcommand — SQLite-only quick check, no server required
+- **[superseded by single-ledger plan]** — OTEL path in /spend/monthly replaced; spend now from transcript token_usage events only
 
 ## Phase 4: Querying & Analysis
 
@@ -147,6 +149,7 @@ Design doc: `doc/claude-session-logs.md`
 
 ### Action 4c.3: SQLite concurrency hardening
 - ✓ DONE - `PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;` in `open_db()` — prevents silent `SQLITE_BUSY` loss under multi-session tmux workflow
+- NOTE: originally labelled "OTEL receiver" in early planning — refers to concurrency hardening; not superseded
 
 ### Action 4c.4: Hook config correctness
 - ✓ DONE - `cmd_init` merges `SessionStart`/`SessionEnd` hooks into `~/.claude/settings.json` directly (idempotent)
@@ -389,6 +392,28 @@ Key findings:
 3. Implement Phase C — `src/archive.rs`, `trakr archive` command, daily timer in serve
 4. Run `trakr repair --dry-run` and report; leave the real repair run to Jim
 5. Action 4d.3 (title/summary in `list`/`show`) — deprioritised pending single-ledger work
+
+─────────────────────────────────────────────────────────────────────────────
+
+## ── CHECKPOINT: Session 2026-06-13 (single-ledger implementation) ────────
+
+**What was completed this session:**
+- Phase A: parser correctness — dedupe by message.id, per-model TokenUsage, subagent inclusion, spend query rewritten (no session_end filter)
+- Phase B: backfill never writes session_end; liveness guard removed; 30s reconciliation loop in serve; repair command; OTEL demoted to informational
+- Phase C: src/archive.rs — daily archive sweep mirroring ~/.claude/projects/ → ~/.trakr/archive/
+- 66 tests passing; cargo build warning-free
+- Before/after spend: $214.19 → $104.82 (2.04× reduction from dedupe fix)
+
+**State of the project:**
+- trakr serve runs reconciliation every 30s and archive daily; spend is accurate from transcripts alone
+- trakr repair --dry-run shows 58 sessions to rebuild (51 with synthetic session_end from old backfill)
+- OTEL receiver still compiles and runs but is informational only
+
+**Immediate next priorities:**
+1. Jim to run `trakr repair --run` to rebuild spend from clean transcripts
+2. Action 4d.3 — surface title/summary in `trakr list` and `trakr show`
+3. Filtering/JSON output on `list`, `show`, `stats`
+4. CI/CD and crates.io publication
 
 ─────────────────────────────────────────────────────────────────────────────
 

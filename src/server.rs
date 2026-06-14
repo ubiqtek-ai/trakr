@@ -27,10 +27,8 @@ struct SpendResponse {
 
 #[derive(Serialize)]
 struct SpendSources {
-    completed_sessions_usd: f64,
-    completed_sessions_count: usize,
-    active_sessions_usd: f64,
-    active_sessions_count: usize,
+    sessions_usd: f64,
+    sessions_count: usize,
 }
 
 #[derive(Serialize)]
@@ -80,7 +78,7 @@ async fn handle_spend_monthly(
 ) -> Result<Json<SpendResponse>, (StatusCode, Json<ErrorResponse>)> {
     let year_month = Utc::now().format("%Y-%m").to_string();
 
-    let (completed_usd, completed_count) = storage::get_monthly_spend_usd(&year_month)
+    let (sessions_usd, sessions_count) = storage::get_monthly_spend_usd(&year_month)
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -88,34 +86,13 @@ async fn handle_spend_monthly(
             )
         })?;
 
-    let completed_ids = storage::get_completed_session_ids().map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse { error: format!("DB error: {}", e) }),
-        )
-    })?;
-
-    // Sum OTEL costs for sessions not yet completed.
-    let (active_count, active_usd) = {
-        let guard = state.costs.lock().unwrap();
-        guard
-            .session_costs
-            .iter()
-            .filter(|(session_id, _)| !completed_ids.contains(*session_id))
-            .fold((0usize, 0.0f64), |(n, sum), (_, cost)| (n + 1, sum + cost))
-    };
-
-    let total = completed_usd + active_usd;
-
     Ok(Json(SpendResponse {
         period: year_month,
-        spent_estimated_usd: round2(total),
+        spent_estimated_usd: round2(sessions_usd),
         budget_usd: state.budget_usd,
         sources: SpendSources {
-            completed_sessions_usd: round2(completed_usd),
-            completed_sessions_count: completed_count,
-            active_sessions_usd: round2(active_usd),
-            active_sessions_count: active_count,
+            sessions_usd: round2(sessions_usd),
+            sessions_count,
         },
         note: "Costs are estimates based on the published Anthropic rate card.",
     }))

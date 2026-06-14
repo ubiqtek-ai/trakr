@@ -4,12 +4,13 @@ A Rust CLI (binary name: `trakr`) that tracks Claude Code context usage and esti
 
 ## Features
 
-- **Hook integration** — `SessionStart`/`SessionEnd` hooks record sessions; at session end the full Claude transcript is parsed for ground-truth token counts (summed across all turns) and archived
-- **Live OTEL metrics** — embedded OTLP HTTP receiver ingests `claude_code.cost.usage` metrics from all running Claude Code sessions, so spend updates while sessions are still active
-- **Cost estimation** — token counts × published Anthropic rate card, per model (Haiku / Sonnet / Opus / Fable)
-- **Month-to-date spend** — aggregates completed sessions (SQLite) + live active sessions (OTEL) against a configurable monthly budget, with double-count protection
-- **Pipeline health check** — `trakr status` verifies the whole chain: settings, hooks, env vars, DB, server, OTEL receiver
-- **Backfill & reconciliation** — imports historical sessions from Claude Code's native logs; a reconciliation sweep on server startup self-heals any missed `SessionEnd` hooks
+- **Transcript-driven tracking** — Claude Code's native session transcripts (`~/.claude/projects/`) are the single source of truth for all spend; no OTEL pipeline required
+- **Hook integration** — `SessionStart`/`SessionEnd` hooks trigger an immediate re-parse of the transcript at session end; the serve loop re-parses every 30 s to catch sessions still in progress
+- **Cost estimation** — token counts × published Anthropic rate card, per model (Haiku / Sonnet / Opus / Fable); spend is summed from all `TokenUsage` events regardless of whether a session has ended
+- **Month-to-date spend** — aggregates all recorded sessions against a configurable monthly budget
+- **Pipeline health check** — `trakr status` checks hooks, DB freshness, and server; OTEL/env-var indicators are informational
+- **Backfill & reconciliation** — imports historical sessions from Claude Code's native logs; a 30 s reconciliation loop in `trakr serve` self-heals any missed `SessionEnd` hooks
+- **Archive** — `trakr archive` mirrors `~/.claude/projects/` to `~/.trakr/archive/` incrementally; `trakr serve` runs this daily
 - **Runs on login** — `trakr install-service` registers a macOS LaunchAgent
 - **SQLite storage** — persistent event log, session metadata (title, summary, project), and archived transcripts
 
@@ -47,22 +48,11 @@ trakr init
 
 This does everything in one step:
 
-- Creates `~/.trakr/` with the SQLite DB (`trakr.db`), `sessions/`, `transcripts/`, and `config.toml`
+- Creates `~/.trakr/` with the SQLite DB (`trakr.db`), `sessions/`, `transcripts/`, `archive/`, and `config.toml`
 - Registers the `SessionStart` and `SessionEnd` hooks in `~/.claude/settings.json` (idempotent merge — your existing settings are preserved)
-- Writes the OTEL telemetry env vars into the `env` block of `~/.claude/settings.json`:
+- Optionally writes OTEL telemetry env vars into `~/.claude/settings.json` (see [Optional: OTEL cross-check](#optional-otel-cross-check) below — these are **not** required for accurate spend tracking)
 
-```json
-{
-  "env": {
-    "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
-    "OTEL_METRICS_EXPORTER": "otlp",
-    "OTEL_EXPORTER_OTLP_ENDPOINT": "http://localhost:4318",
-    "OTEL_EXPORTER_OTLP_PROTOCOL": "http/json"
-  }
-}
-```
-
-Scoping the env vars to Claude Code's settings means no shell profile changes are needed. `CLAUDE_CODE_ENABLE_TELEMETRY` and `OTEL_METRICS_EXPORTER` are both required — without them Claude Code exports no telemetry at all.
+Scoping any env vars to Claude Code's settings means no shell profile changes are needed.
 
 ### 2. Start the server
 
@@ -74,7 +64,7 @@ trakr serve
 
 ### 3. Restart your Claude Code sessions
 
-**Env var changes only apply to newly started sessions.** Already-running Claude Code sessions will not export metrics. Start a new session, and expect the first metrics batch roughly a minute in — Claude Code exports OTEL metrics on an interval (~60 s by default).
+Hook registrations take effect in newly started Claude Code sessions. Already-running sessions will be backfilled automatically by the reconciliation loop the next time `trakr serve` runs.
 
 ### 4. Verify
 
@@ -89,13 +79,13 @@ Claude Code settings  (~/.claude/settings.json)
 ------------------------------------------------------------
   ✓ SessionStart hook                trakr hook session-start
   ✓ SessionEnd hook                  trakr hook session-end
-  ✓ CLAUDE_CODE_ENABLE_TELEMETRY     1
-  ✓ OTEL_METRICS_EXPORTER            otlp
-  ✓ OTEL_EXPORTER_OTLP_ENDPOINT      http://localhost:4318
-  ✓ OTEL_EXPORTER_OTLP_PROTOCOL      http/json
 ...
-  ✓ OTEL receiver                    1 batches, 1 active session(s), $0.27
+  ✓ DB                               trakr.db — last activity 12s ago
+  ✓ Server                           http://localhost:8788 — reachable
+  i OTEL receiver                    not configured (informational only)
 ```
+
+OTEL and hook indicators marked with `i` are informational — transcript pipeline and DB freshness are the health signal.
 
 ---
 
@@ -108,13 +98,12 @@ trakr spend
 ```
 Spend  2026-06  (budget $200.00)
 ------------------------------------------
-  Completed sessions (42)        $  329.69
-  Active sessions (1)            $    0.27
+  All sessions (43)              $  104.82
 ------------------------------------------
-  Total                          $  329.96
+  Total                          $  104.82
 ```
 
-`trakr spend` queries the live API first (completed + active sessions); if the server isn't running it falls back to SQLite and shows completed sessions only, with a note.
+`trakr spend` runs an inline reconciliation sweep before reading SQLite, so results are always up to date whether or not the server is running. Spend is summed from all `token_usage` events keyed on the last activity timestamp — no `session_end` required.
 
 ### HTTP API
 
@@ -125,21 +114,20 @@ curl -s http://localhost:8788/spend/monthly
 ```json
 {
   "period": "2026-06",
-  "spent_estimated_usd": 329.96,
+  "spent_estimated_usd": 104.82,
   "budget_usd": 200.0,
   "sources": {
-    "completed_sessions_usd": 329.69,
-    "completed_sessions_count": 42,
-    "active_sessions_usd": 0.27,
+    "all_sessions_usd": 104.82,
+    "all_sessions_count": 43,
     "active_sessions_count": 1
   },
   "note": "Costs are estimates based on the published Anthropic rate card."
 }
 ```
 
-Sessions that already have a `session_end` in SQLite are excluded from the OTEL live total, so a session is never counted twice as it transitions from active to completed.
+Active sessions (those with `last_activity_at` within the last hour) are identified in the response for informational purposes, but spend is sourced from transcripts for all sessions — completed or not.
 
-`GET /status` reports OTEL receiver health (batches received, last receive time, active sessions and their live cost) — this is what `trakr status` uses.
+`GET /status` reports server health and DB freshness — this is what `trakr status` uses.
 
 ### tmux status line
 
@@ -165,9 +153,13 @@ set -g status-interval 30
 
 ## How tracking works
 
-- **`SessionEnd` hook** is the source of truth for completed sessions. It parses Claude Code's native session log (the `transcript_path` from the hook payload), sums token usage across **all** turns, replaces any partial data for that session atomically, archives the full transcript to `~/.trakr/transcripts/`, and extracts the session title, compact summary, and last prompt into the `sessions` table.
-- **OTEL receiver** covers the gap the hooks can't: sessions that are still running. Claude Code pushes `claude_code.cost.usage` metrics to `localhost:4318`, which the server aggregates per session ID.
-- **Reconciliation sweep** on `trakr serve` startup backfills any sessions whose `SessionEnd` hook was missed (crash, force-quit) from Claude's native logs.
+Claude Code's transcripts (`~/.claude/projects/`) are the **single source** for all spend. There is no separate OTEL pipeline for accuracy.
+
+- **`SessionEnd` hook** triggers an immediate re-parse of the transcript (`transcript_path` from the hook payload). Token usage is summed across **all** turns (deduped by `message.id`), data for that session is replaced atomically, the full transcript is archived to `~/.trakr/transcripts/`, and title/summary/last prompt are extracted into the `sessions` table.
+- **30 s reconciliation loop** in `trakr serve` re-parses all recently active transcripts, catching sessions still in progress (no `SessionEnd` hook yet) and sessions whose hook was missed due to crash or force-quit.
+- **`trakr spend`** runs an inline sweep before reading SQLite, so the result is always current even if the server is not running.
+- **Spend is summed from all `token_usage` events** regardless of whether a session has ended — there is no completed/active split in the core accounting.
+- **Subagent files** in the same `~/.claude/projects/<slug>/` directory are included in the parse, so agent-spawned sub-sessions are counted.
 - Hook handlers always exit 0 — they never block Claude Code, even on error.
 
 ---
@@ -183,7 +175,7 @@ monthly_budget_usd = 50.0
 # Port for the HTTP API server (GET /spend/monthly, GET /status).
 api_port = 8788
 
-# Port for the OTLP HTTP receiver.
+# Port for the OTLP HTTP receiver (optional — used only for OTEL cross-check).
 otel_port = 4318
 ```
 
@@ -193,7 +185,7 @@ Port overrides are also available as CLI flags:
 trakr serve --api-port 9090 --otel-port 5318
 ```
 
-If you change `otel_port`, update `OTEL_EXPORTER_OTLP_ENDPOINT` in `~/.claude/settings.json` to match, then start a new Claude Code session.
+If you change `otel_port` and are using the optional OTEL cross-check, update `OTEL_EXPORTER_OTLP_ENDPOINT` in `~/.claude/settings.json` to match, then start a new Claude Code session.
 
 ---
 
@@ -201,10 +193,12 @@ If you change `otel_port`, update `OTEL_EXPORTER_OTLP_ENDPOINT` in `~/.claude/se
 
 | Command | Description |
 |---|---|
-| `trakr init` | Set up `~/.trakr/`, register hooks and OTEL env vars in Claude Code settings |
-| `trakr status` | Health-check the full pipeline: settings, hooks, env vars, DB, server, OTEL |
-| `trakr spend` | Month-to-date spend (live API with SQLite fallback) |
-| `trakr serve` | Run the HTTP API server and OTEL receiver in the foreground |
+| `trakr init` | Set up `~/.trakr/`, register hooks in Claude Code settings |
+| `trakr status` | Health-check: hooks, DB freshness, server reachability; OTEL/env-var checks are informational |
+| `trakr spend` | Month-to-date spend (runs inline sweep; no server required) |
+| `trakr serve` | Run the HTTP API server, 30 s reconciliation loop, and daily archive sweep in the foreground |
+| `trakr archive` | Mirror `~/.claude/projects/` → `~/.trakr/archive/` incrementally (also runs daily via `serve`) |
+| `trakr repair` | Rebuild spend for sessions with synthetic `session_end` events from old backfill versions (`--dry-run` / `--run`) |
 | `trakr install-service` | Install `trakr serve` as a macOS LaunchAgent (starts on login) |
 | `trakr uninstall-service` | Stop and remove the LaunchAgent |
 | `trakr logs` | Tail the server log (`~/.trakr/serve.log`) |
@@ -228,12 +222,15 @@ If you change `otel_port`, update `OTEL_EXPORTER_OTLP_ENDPOINT` in `~/.claude/se
 ├── config.toml       budget and port config
 ├── serve.log         server log (when running as a LaunchAgent)
 ├── sessions/         legacy JSONL backups per session
-└── transcripts/
-    ├── <session-id>.jsonl    full Claude transcript, archived at SessionEnd
-    └── ...
+├── transcripts/
+│   ├── <session-id>.jsonl    full Claude transcript, archived at SessionEnd
+│   └── ...
+└── archive/          incremental mirror of ~/.claude/projects/ (canonical backup)
+    └── <project-slug>/
+        └── <session-id>.jsonl
 ```
 
-Events recorded: `tool_use`, `session_start`, `session_end`, `token_usage`, `subagent_start`, `subagent_stop`, `context_compression`. The `sessions` table additionally holds `project_path`, `started_at`, `ended_at`, `model`, `title`, `summary`, and `last_prompt` per session.
+Events recorded: `tool_use`, `session_start`, `session_end`, `token_usage`, `subagent_start`, `subagent_stop`, `context_compression`. The `sessions` table additionally holds `project_path`, `started_at`, `ended_at`, `model`, `title`, `summary`, `last_prompt`, `last_activity_at`, `file_size`, and `file_mtime` per session.
 
 ---
 
@@ -254,17 +251,36 @@ Cache read is billed at 10% of the input rate. Cache creation is billed at the f
 
 ## Troubleshooting
 
-**`trakr status` says the OTEL receiver has never received metrics**
-The env vars in `~/.claude/settings.json` only take effect in *new* Claude Code sessions. Start a fresh session and wait ~60 s for the first export interval. Verify all four env vars are present (`trakr status` checks them individually).
+**Spend looks too low**
+Run `trakr spend` — it does an inline sweep before reading SQLite, so the server being down doesn't matter. If old sessions are missing, run `trakr backfill-logs` to re-import them from Claude's native logs. If you upgraded from a version that wrote synthetic `session_end` events into backfill output, run `trakr repair --dry-run` to see affected sessions, then `trakr repair --run` to rebuild them from the surviving transcripts.
+
+**`trakr status` shows OTEL warnings**
+OTEL is a cross-check only — spend is accurate from transcripts alone. If you want OTEL as a secondary confirmation, see [Optional: OTEL cross-check](#optional-otel-cross-check) below. OTEL warnings do not affect spend accuracy.
 
 **OTEL endpoint conflicts**
 trakr speaks OTLP **HTTP/JSON** only — `OTEL_EXPORTER_OTLP_PROTOCOL` must be `http/json`, not `grpc` or `http/protobuf`. If another collector already owns port 4318, change `otel_port` in config and the endpoint env var together.
 
-**Spend looks too low**
-If the server isn't running, `trakr spend` shows completed sessions only. Sessions ended while nothing was tracking are recovered by the reconciliation sweep the next time `trakr serve` starts, or manually via `trakr backfill-logs`.
-
 **Server running an old binary**
 After upgrading, restart the service: `trakr uninstall-service && trakr install-service`.
+
+---
+
+## Optional: OTEL cross-check
+
+OTEL is **not required** for accurate spend tracking — transcripts are the single source of truth. If you want OTEL as a secondary confirmation, add these env vars to the `env` block of `~/.claude/settings.json`:
+
+```json
+{
+  "env": {
+    "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
+    "OTEL_METRICS_EXPORTER": "otlp",
+    "OTEL_EXPORTER_OTLP_ENDPOINT": "http://localhost:4318",
+    "OTEL_EXPORTER_OTLP_PROTOCOL": "http/json"
+  }
+}
+```
+
+These take effect in newly started Claude Code sessions. The first metrics batch arrives roughly 60 s in (Claude Code's default export interval). `trakr status` shows OTEL receiver state, but a missing or unconfigured OTEL receiver is normal and expected in the single-ledger architecture.
 
 ---
 
