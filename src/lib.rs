@@ -5,6 +5,7 @@ pub mod cost;
 pub mod event;
 pub mod hooks;
 pub mod otel_receiver;
+pub mod rates;
 pub mod server;
 pub mod storage;
 pub mod transcript;

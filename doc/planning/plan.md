@@ -444,6 +444,36 @@ Key findings:
 
 ─────────────────────────────────────────────────────────────────────────────
 
+## ── CHECKPOINT: Session 2026-06-14 (daemon polish + status line integration) ──
+
+**What was completed this session:**
+- Hooks removed: `write_hooks_to_settings()` and `suggested_hook_config()` deleted; `cmd_init` no longer writes hooks to `~/.claude/settings.json`; `~/.claude/settings.json` cleaned of `SessionStart`/`SessionEnd` hook entries
+- `trakr restart-service` command added (`cmd_uninstall_service` + `cmd_install_service`)
+- `tlog!` macro added for timestamped daemon logs (local time + UTC offset via `chrono::Local`)
+- Daemon startup/shutdown log lines: `daemon starting` (canonical: budget, sync interval, api state, home dir) and `daemon stopping` via SIGTERM handler
+- Reconciliation renamed to "syncing" throughout logs
+- API server made optional: `api_enabled` flag in config (default `false`); `std::future::pending::<()>().await` parks runtime when disabled
+- `sync_interval_secs` added to config (default 30s), wired into serve loop
+- `cmd_status` cleaned up: hook section removed, OTEL env vars removed, API shown as disabled, service section renamed
+- `doc/serve-daemon.md` created: documents daemon architecture, sync loop, SIGTERM handling, log format
+- `doc/README.md` updated: Architecture section added pointing to serve-daemon.md
+- `trakr spend --json` flag: fast DB-only path, outputs `{"spent":N,"budget":N,"pct":N}` for status line
+- `~/dotfiles/home/claude/statusline-command.sh` updated: `trakr spend --json` section with colour coding and `command -v trakr` guard
+- `~/.claude/settings.json` `statusLine` field added pointing to the script
+
+**State of the project:**
+- Claude Code status line live: shows spend/budget with colour (green/yellow/red) from `trakr spend --json`
+- 66 tests passing; `cargo build` clean; launchd service restarted
+- Hook-free architecture fully in effect: 30s reconciliation loop is the sole update mechanism
+
+**Immediate next priorities:**
+1. Action 4d.3 — `trakr list` with title + project; `trakr show` with title + summary
+2. Filtering/JSON output on `list`, `show`, `stats`
+3. README update to document `sync`, `inspect-logs` redesign, `repair` default, no-hooks architecture
+4. CI/CD and crates.io publication (Action 5.3)
+
+─────────────────────────────────────────────────────────────────────────────
+
 ## Implementation Notes
 
 ### Architecture

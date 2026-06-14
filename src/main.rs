@@ -126,6 +126,8 @@ enum Commands {
     Archive,
     /// Manually trigger a session-log reconciliation and print a summary
     Sync,
+    /// Fetch current model pricing from LiteLLM and update ~/.trakr/rates.json
+    SyncRates,
 }
 
 fn main() {
@@ -163,6 +165,7 @@ fn run(cli: Cli) -> Result<()> {
         Commands::RestartService => { cmd_uninstall_service()?; cmd_install_service() },
         Commands::Archive => cmd_archive(),
         Commands::Sync => cmd_sync(),
+        Commands::SyncRates => cmd_sync_rates(),
     }
 }
 
@@ -1091,12 +1094,12 @@ fn cmd_serve(api_port_override: Option<u16>, _otel_port_override: Option<u16>) -
 
     storage::init_db()?;
 
-    let home_dir = dirs::home_dir().map(|p| p.display().to_string()).unwrap_or_else(|| "unknown".to_string());
+    let trakr_dir = dirs::home_dir().map(|p| p.join(".trakr").display().to_string()).unwrap_or_else(|| "unknown".to_string());
     tlog!("trakr: daemon starting  budget=${:.2}  sync={}s  api={}  home={}",
         cfg.monthly_budget_usd,
         cfg.sync_interval_secs,
         if cfg.api_enabled { format!("enabled (:{} )", cfg.api_port) } else { "disabled".to_string() },
-        home_dir,
+        trakr_dir,
     );
 
     let rt = tokio::runtime::Runtime::new().context("creating tokio runtime")?;
@@ -1124,6 +1127,19 @@ fn cmd_serve(api_port_override: Option<u16>, _otel_port_override: Option<u16>) -
                     }
                 }
                 tokio::time::sleep(tokio::time::Duration::from_secs(sync_interval)).await;
+            }
+        });
+
+        // Spawn a daily rates refresh task. Runs once at startup then every 24 h.
+        tokio::spawn(async {
+            loop {
+                let result = tokio::task::spawn_blocking(|| ctx_trakr::rates::refresh_rates()).await;
+                match result {
+                    Ok(Ok(n))  => tlog!("trakr: rates refreshed: {} Claude models", n),
+                    Ok(Err(e)) => tlog!("trakr: rates refresh warning: {:#}", e),
+                    Err(e)     => tlog!("trakr: rates task panicked: {:#}", e),
+                }
+                tokio::time::sleep(tokio::time::Duration::from_secs(86_400)).await;
             }
         });
 
@@ -1274,6 +1290,35 @@ fn cmd_sync() -> Result<()> {
     Ok(())
 }
 
+fn cmd_sync_rates() -> Result<()> {
+    use ctx_trakr::rates;
+    use std::io::Write as IoWrite;
+
+    let (msg, summary) = match rates::refresh_rates() {
+        Ok(n)  => (
+            format!("{} trakr: rates refreshed: {} Claude models\n",
+                chrono::Local::now().format("%Y-%m-%d %H:%M:%S %:z"), n),
+            format!("Rates synced ({} models)", n),
+        ),
+        Err(e) => (
+            format!("{} trakr: rates refresh failed: {:#}\n",
+                chrono::Local::now().format("%Y-%m-%d %H:%M:%S %:z"), e),
+            format!("Rates sync failed: {:#}", e),
+        ),
+    };
+
+    // Append to serve.log so the event is visible alongside daemon output.
+    if let Ok(home) = dirs::home_dir().ok_or(()) {
+        let log_path = home.join(".trakr").join("serve.log");
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+            let _ = f.write_all(msg.as_bytes());
+        }
+    }
+
+    println!("{}", summary);
+    Ok(())
+}
+
 fn cmd_status() -> Result<()> {
     use ctx_trakr::config;
 
@@ -1358,6 +1403,25 @@ fn cmd_status() -> Result<()> {
             .count())
         .unwrap_or(0);
     println!("  {} {:<32} {} archived", ok(transcripts_dir.exists()), "transcripts/", transcript_count);
+
+    let rates_label = match ctx_trakr::rates::last_fetched_at() {
+        Some(dt) => {
+            let age_mins = Utc::now().signed_duration_since(dt).num_minutes();
+            let when = if age_mins < 60 {
+                format!("{} min ago", age_mins)
+            } else if age_mins < 1440 {
+                format!("{} h ago", age_mins / 60)
+            } else {
+                format!("{} days ago", age_mins / 1440)
+            };
+            format!("fetched {}  (run `trakr sync-rates` to refresh)", when)
+        }
+        None => "not fetched yet — run `trakr sync-rates`".to_string(),
+    };
+    let rates_fresh = ctx_trakr::rates::last_fetched_at()
+        .map(|dt| Utc::now().signed_duration_since(dt).num_hours() < 48)
+        .unwrap_or(false);
+    println!("  {} {:<32} {}", ok(rates_fresh), "rates.json", rates_label);
 
     // ── Server (informational) ─────────────────────────────────────────────────
 

@@ -319,7 +319,9 @@ pub fn get_completed_session_ids() -> Result<std::collections::HashSet<String>> 
 ///
 /// Returns `(total_usd, session_count)`.
 pub fn get_monthly_spend_usd(year_month: &str) -> Result<(f64, usize)> {
-    use crate::cost::compute_cost_usd;
+    use crate::cost::compute_cost_usd_with_card;
+    use crate::rates;
+    let card = rates::load_rate_card();
 
     let conn = open_db()?;
 
@@ -370,12 +372,13 @@ pub fn get_monthly_spend_usd(year_month: &str) -> Result<(f64, usize)> {
                 ..
             } = event
             {
-                total_usd += compute_cost_usd(
+                total_usd += compute_cost_usd_with_card(
                     &model,
                     input_tokens,
                     output_tokens,
                     cache_creation_input_tokens,
                     cache_read_input_tokens,
+                    &card,
                 );
             }
         }
@@ -711,7 +714,9 @@ pub fn get_all_sessions_meta() -> Result<Vec<SessionMeta>> {
 /// Returns a `HashMap<session_id, total_usd>`.  Sessions with no token_usage events
 /// are absent from the map (not present with a zero value).
 pub fn get_spend_by_session() -> Result<std::collections::HashMap<String, f64>> {
-    use crate::cost::compute_cost_usd;
+    use crate::cost::compute_cost_usd_with_card;
+    use crate::rates;
+    let card = rates::load_rate_card();
 
     let conn = open_db()?;
     let mut stmt = conn.prepare(
@@ -738,12 +743,13 @@ pub fn get_spend_by_session() -> Result<std::collections::HashMap<String, f64>> 
             ..
         } = event
         {
-            *map.entry(session_id).or_insert(0.0) += compute_cost_usd(
+            *map.entry(session_id).or_insert(0.0) += compute_cost_usd_with_card(
                 &model,
                 input_tokens,
                 output_tokens,
                 cache_creation_input_tokens,
                 cache_read_input_tokens,
+                &card,
             );
         }
     }
@@ -753,7 +759,9 @@ pub fn get_spend_by_session() -> Result<std::collections::HashMap<String, f64>> 
 
 /// Sum ALL `token_usage` events across every session.
 pub fn get_total_spend_usd() -> Result<f64> {
-    use crate::cost::compute_cost_usd;
+    use crate::cost::compute_cost_usd_with_card;
+    use crate::rates;
+    let card = rates::load_rate_card();
 
     let conn = open_db()?;
     let mut stmt = conn
@@ -778,12 +786,13 @@ pub fn get_total_spend_usd() -> Result<f64> {
             ..
         } = event
         {
-            total += compute_cost_usd(
+            total += compute_cost_usd_with_card(
                 &model,
                 input_tokens,
                 output_tokens,
                 cache_creation_input_tokens,
                 cache_read_input_tokens,
+                &card,
             );
         }
     }
