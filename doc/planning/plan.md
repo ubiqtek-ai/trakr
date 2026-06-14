@@ -1,9 +1,9 @@
 # Implementation Plan
 
 ## ── WHAT'S NEXT ──────────────────────────────────────────────────────────
-**Next:** Run `trakr repair --run` to rebuild spend from corrected transcripts, then Action 4d.3 (title/summary in list/show)
+**Next:** Action 4d.3 — surface `title` + `summary` in `trakr list` and `trakr show`
 **Sub-doc:** (none)
-**Blockers:** Repair run requires Jim to execute manually (see last checkpoint)
+**Blockers:** None
 ─────────────────────────────────────────────────────────────────────────────
 
 ## Phase 1: Project Foundation
@@ -190,6 +190,7 @@ Key findings:
 ### Action 4d.3: Expose in CLI
 - TODO - `trakr show <session>` — print `title` + `summary` if present
 - TODO - `trakr list` — show title alongside session ID and project
+- NOTE - `inspect-logs --verbose` now shows title + per-session spend (2026-06-14)
 
 ## Phase 5: Polish & Release
 
@@ -414,6 +415,32 @@ Key findings:
 2. Action 4d.3 — surface title/summary in `trakr list` and `trakr show`
 3. Filtering/JSON output on `list`, `show`, `stats`
 4. CI/CD and crates.io publication
+
+─────────────────────────────────────────────────────────────────────────────
+
+## ── CHECKPOINT: Session 2026-06-14 (single-ledger complete + UX polish) ────
+
+**What was completed this session:**
+- `trakr repair --run` executed: 60 sessions rebuilt from corrected parser, spend corrected
+- Bug fixes landed: `aiTitle` field name (titles now populate), `parse_timestamp` Utc::now() fallback (was stomping `last_activity_at` for all backfilled sessions → fake 34 "active" sessions), `trakr repair` defaults to `--run` (no flag required)
+- `trakr spend` redesigned: local time with UTC offset, session count in title line, clean 3-row table (Cost / Budget / Used), no OTEL noise
+- `trakr inspect-logs` redesigned: single-ledger aware (Stale / New / Orphaned counts), all-time + monthly spend, `--verbose` per-session table with title + spend + sync status; hooks-era Complete/Partial/Missing terminology removed
+- `trakr sync` new command: manually triggers reconciliation sweep, prints stats + timestamp
+- `TrackingStatus`, `SessionSummary`, `inspect_logs` (hooks-era dead code) deleted from `backfill.rs`
+- New storage functions: `get_all_sessions_meta`, `get_spend_by_session`, `get_total_spend_usd`
+- 66 tests passing; `cargo build` warning-free
+
+**State of the project:**
+- `trakr spend` shows $112.95 / $200.00 (56.5%) for June 2026 — accurate single-source figure
+- `trakr inspect-logs` shows 60/60 sessions in DB, 0 stale, titles populated; all-time spend $225.65
+- `trakr serve` running as launchd service (30 s reconciliation loop, daily archive sweep)
+- Single-ledger architecture fully live; OTEL receiver parked but compiles
+
+**Immediate next priorities:**
+1. Action 4d.3 — `trakr list` with title + project; `trakr show` with title + summary
+2. Filtering/JSON output on `list`, `show`, `stats`
+3. README update to document `sync`, `inspect-logs` redesign, `repair` default behaviour
+4. CI/CD and crates.io publication (Action 5.3)
 
 ─────────────────────────────────────────────────────────────────────────────
 
