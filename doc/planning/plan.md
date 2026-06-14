@@ -192,6 +192,18 @@ Key findings:
 - TODO - `trakr list` — show title alongside session ID and project
 - NOTE - `inspect-logs --verbose` now shows title + per-session spend (2026-06-14)
 
+## Phase 4e: Dynamic Pricing via LiteLLM
+
+### Action 4e.1: Live rate card from LiteLLM
+- ✓ DONE - `src/rates.rs` — fetch `https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json`; parse Claude model entries; cache to `~/.trakr/rates.json`
+- ✓ DONE - `src/cost.rs` refactored — `compute_cost_usd_with_card` (takes `&RateCard`); `compute_cost_usd` loads card from disk on each call; cache_creation rate corrected from 1× to 1.25× input (matches Anthropic published pricing)
+- ✓ DONE - `src/storage.rs` — 3 spend query functions load rate card once per function (not per event)
+- ✓ DONE - `trakr sync-rates` command — fetches and caches rates, prints "Rates synced (N models)" to stdout, appends timestamped line to `serve.log`
+- ✓ DONE - `trakr serve` — daily rates refresh task (runs at startup + every 24 h via `tokio::spawn`)
+- ✓ DONE - `trakr status` — Storage section shows when rates were last fetched; warns if > 48 h stale
+- ✓ DONE - Daemon startup log now shows `~/.trakr` dir instead of `~`
+- NOTE - LiteLLM fetches 237 Claude entries (all provider variants); exact key match on `claude-*` names used by Claude Code; provider-namespaced entries (`anthropic.*`, `bedrock/*`) unused but harmless
+
 ## Phase 5: Polish & Release
 
 ### Action 5.1: Testing
@@ -210,30 +222,6 @@ Key findings:
 - TODO - GitHub Actions CI/CD setup
 
 ---
-
-## ── CHECKPOINT: Session 2026-06-10 ──────────────────────────────────────
-
-**What was completed this session:**
-- Phase 3 (spend tracking) fully implemented: cost.rs, config.rs, otel_receiver.rs, server.rs
-- New deps: tokio, axum, toml
-- New CLI commands: `serve`, `spend`
-- `init` now writes default config.toml
-- README rewritten from scratch (previous version described a different, unimplemented design)
-- 42 → 44 passing tests (added cost + config + otel_receiver tests)
-
-**State of the binary:**
-- `ctx-trakr spend` works against live DB today ($0.24 / $50.00 from 7 sessions)
-- `ctx-trakr serve` starts cleanly; GET /spend/monthly returns correct JSON
-- All 44 tests pass; `cargo build` clean
-
-**Known gaps / next priorities:**
-1. OTEL protocol — only http/json supported; protobuf would be more compatible with Claude Code defaults. Consider adding `opentelemetry-proto` dep for v2.
-2. `session_id` in OTEL — assumed to be present as a data-point or resource attribute. Needs real-world validation against Claude Code's actual OTEL output.
-3. `cmd_spend` prints a note directing users to `serve` — could instead try a live HTTP call to the server if it's already running, and fall back to SQLite only.
-4. Filtering / JSON output on `list`, `show`, `stats` — still TODO.
-5. CI/CD and crates.io publication — still TODO.
-
-─────────────────────────────────────────────────────────────────────────────
 
 ## ── CHECKPOINT: Session 2026-06-10 (continued) ──────────────────────────
 
@@ -470,6 +458,30 @@ Key findings:
 1. Action 4d.3 — `trakr list` with title + project; `trakr show` with title + summary
 2. Filtering/JSON output on `list`, `show`, `stats`
 3. README update to document `sync`, `inspect-logs` redesign, `repair` default, no-hooks architecture
+4. CI/CD and crates.io publication (Action 5.3)
+
+─────────────────────────────────────────────────────────────────────────────
+
+## ── CHECKPOINT: Session 2026-06-14 (dynamic pricing + UX fixes) ────────────
+
+**What was completed this session:**
+- Phase 4e fully implemented: `src/rates.rs` — fetch/cache/resolve from LiteLLM price list
+- `src/cost.rs` refactored to use `rates::resolve`; cache_creation rate corrected to 1.25× input (was 1×)
+- `src/storage.rs` — 3 spend query functions load rate card once per call, not per event
+- `trakr sync-rates` command — fetches rates, logs timestamped line to `serve.log`, prints "Rates synced (N models)" to stdout
+- `trakr serve` — daily rates refresh task alongside existing archive sweep
+- `trakr status` — Storage section now shows rates.json last-fetched age; stale if > 48 h
+- Daemon startup log: `home=` now shows `~/.trakr` instead of `~`
+
+**State of the project:**
+- 66 tests passing; `cargo build` clean; `trakr sync-rates` live (237 Claude models cached)
+- Rate card sourced from LiteLLM with exact key matches for all current Claude Code models; hardcoded fallback retained for offline use
+- `trakr serve` daemon still running (launchd); will pick up daily rate refresh on next 24 h cycle
+
+**Immediate next priorities:**
+1. Action 4d.3 — `trakr list` with title + project; `trakr show` with title + summary
+2. Filtering/JSON output on `list`, `show`, `stats`
+3. README update to document `sync-rates`, `sync`, `inspect-logs` redesign, no-hooks architecture
 4. CI/CD and crates.io publication (Action 5.3)
 
 ─────────────────────────────────────────────────────────────────────────────
