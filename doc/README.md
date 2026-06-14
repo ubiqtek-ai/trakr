@@ -46,6 +46,10 @@
   agent-agnostic typed events → projections. Records the 2026-06-12 decision
   to park OTEL and hooks.
 
+## Architecture
+
+- **[serve-daemon.md](serve-daemon.md)** — How `trakr serve` works: threading model, the 30 s reconciliation loop, WAL concurrency, relationship to the SessionEnd hook, and service management commands.
+
 ## Planning
 
 - **[planning/plan.md](planning/plan.md)** — Living implementation plan:

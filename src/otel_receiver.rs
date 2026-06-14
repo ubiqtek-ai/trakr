@@ -40,13 +40,13 @@ pub async fn start_otel_receiver(port: u16, costs: SessionCosts) {
     let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("trakr: OTEL receiver failed to bind on {}: {}", addr, e);
+            eprintln!("{} trakr: OTEL receiver failed to bind on {}: {}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"), addr, e);
             return;
         }
     };
-    eprintln!("trakr: OTEL receiver listening on {}", addr);
+    eprintln!("{} trakr: OTEL receiver listening on {}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"), addr);
     if let Err(e) = axum::serve(listener, app).await {
-        eprintln!("trakr: OTEL receiver error: {}", e);
+        eprintln!("{} trakr: OTEL receiver error: {}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"), e);
     }
 }
 

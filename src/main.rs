@@ -2,6 +2,12 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use chrono::{Datelike, Utc};
 
+macro_rules! tlog {
+    ($($arg:tt)*) => {
+        eprintln!("{} {}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"), format_args!($($arg)*))
+    };
+}
+
 use ctx_trakr::archive;
 use ctx_trakr::backfill;
 use ctx_trakr::hooks;
@@ -61,7 +67,11 @@ enum Commands {
         otel_port: Option<u16>,
     },
     /// Show month-to-date estimated spend from completed sessions (SQLite only)
-    Spend,
+    Spend {
+        /// Output compact JSON instead of the human-readable table (no reconciliation)
+        #[arg(long)]
+        json: bool,
+    },
     /// Check the health of the full tracking pipeline (settings, hooks, OTEL, server, DB)
     Status,
     /// Backfill session data from Claude Code's native session logs
@@ -110,6 +120,8 @@ enum Commands {
     InstallService,
     /// Remove the trakr LaunchAgent
     UninstallService,
+    /// Restart the trakr LaunchAgent (picks up a new binary)
+    RestartService,
     /// Copy Claude transcripts from ~/.claude/projects/ into ~/.trakr/archive/ (incremental)
     Archive,
     /// Manually trigger a session-log reconciliation and print a summary
@@ -135,7 +147,7 @@ fn run(cli: Cli) -> Result<()> {
         Commands::Stats => cmd_stats(),
         Commands::Reset { yes } => cmd_reset(yes),
         Commands::Serve { api_port, otel_port } => cmd_serve(api_port, otel_port),
-        Commands::Spend => cmd_spend(),
+        Commands::Spend { json } => cmd_spend(json),
         Commands::Status => cmd_status(),
         Commands::BackfillLogs { project, since, dry_run } => {
             cmd_backfill_logs(project.as_deref(), since.as_deref(), dry_run)
@@ -148,6 +160,7 @@ fn run(cli: Cli) -> Result<()> {
         Commands::Logs { lines } => cmd_logs(lines),
         Commands::InstallService => cmd_install_service(),
         Commands::UninstallService => cmd_uninstall_service(),
+        Commands::RestartService => { cmd_uninstall_service()?; cmd_install_service() },
         Commands::Archive => cmd_archive(),
         Commands::Sync => cmd_sync(),
     }
@@ -1211,9 +1224,14 @@ fn cmd_serve(api_port_override: Option<u16>, otel_port_override: Option<u16>) ->
             loop {
                 let result = tokio::task::spawn_blocking(run_log_reconciliation).await;
                 match result {
-                    Ok(Err(e)) => eprintln!("trakr: reconciliation warning: {:#}", e),
-                    Err(e)    => eprintln!("trakr: reconciliation task panicked: {:#}", e),
-                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => tlog!("trakr: reconciliation warning: {:#}", e),
+                    Err(e)    => tlog!("trakr: reconciliation task panicked: {:#}", e),
+                    Ok(Ok(stats)) => {
+                        if stats.n_new > 0 || stats.n_updated > 0 {
+                            tlog!("trakr: reconcile: {} new, {} updated, {} unchanged",
+                                stats.n_new, stats.n_updated, stats.n_unchanged);
+                        }
+                    }
                 }
                 tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
             }
@@ -1236,17 +1254,15 @@ fn cmd_serve(api_port_override: Option<u16>, otel_port_override: Option<u16>) ->
                         .with_context(|| format!("creating archive dir {}", archive_dir.display()))?;
                     let stats = archive::run_archive_sweep(&projects_dir, &archive_dir)?;
                     if stats.copied > 0 {
-                        eprintln!(
-                            "trakr: archive sweep: {} file(s) copied ({} bytes), {} unchanged",
-                            stats.copied, stats.bytes_copied, stats.unchanged
-                        );
+                        tlog!("trakr: archive sweep: {} file(s) copied ({} bytes), {} unchanged",
+                            stats.copied, stats.bytes_copied, stats.unchanged);
                     }
                     Ok::<(), anyhow::Error>(())
                 })
                 .await;
                 match result {
-                    Ok(Err(e)) => eprintln!("trakr: archive warning: {:#}", e),
-                    Err(e)    => eprintln!("trakr: archive task panicked: {:#}", e),
+                    Ok(Err(e)) => tlog!("trakr: archive warning: {:#}", e),
+                    Err(e)    => tlog!("trakr: archive task panicked: {:#}", e),
                     Ok(Ok(())) => {}
                 }
                 tokio::time::sleep(tokio::time::Duration::from_secs(86_400)).await;
@@ -1262,16 +1278,32 @@ fn cmd_serve(api_port_override: Option<u16>, otel_port_override: Option<u16>) ->
     Ok(())
 }
 
-fn cmd_spend() -> Result<()> {
+fn cmd_spend(json: bool) -> Result<()> {
     use ctx_trakr::config;
 
     let cfg = config::load_config()?;
     let year_month = Utc::now().format("%Y-%m").to_string();
 
+    storage::init_db()?;
+
+    if json {
+        // Fast path: DB read only, no reconciliation. The serve daemon keeps the DB current.
+        let (spent, count) = storage::get_monthly_spend_usd(&year_month)?;
+        let pct = if cfg.monthly_budget_usd > 0.0 { spent / cfg.monthly_budget_usd * 100.0 } else { 0.0 };
+        println!(
+            r#"{{"month":"{month}","spent_usd":{spent:.2},"budget_usd":{budget:.2},"pct":{pct:.1},"sessions":{count}}}"#,
+            month  = year_month,
+            spent  = spent,
+            budget = cfg.monthly_budget_usd,
+            pct    = pct,
+            count  = count,
+        );
+        return Ok(());
+    }
+
     // B4: always use SQLite — no OTEL term, no live-API-vs-SQLite split.
     // Run one inline incremental sweep before reading; sub-second when nothing changed
     // because the change-detection logic skips unchanged sessions without a full re-parse.
-    storage::init_db()?;
     if let Err(e) = run_log_reconciliation() {
         eprintln!("trakr: reconciliation warning: {:#}", e);
     }
