@@ -19,18 +19,18 @@ A Rust CLI (binary name: `trakr`) that tracks Claude Code context usage and esti
 
 ## Installation
 
+### From crates.io
+
+```bash
+cargo install trakr
+```
+
 ### From source
 
 ```bash
-git clone https://github.com/ubiqtek/ctx-trakr.git
-cd ctx-trakr
+git clone https://github.com/ubiqtek-ai/trakr.git
+cd trakr
 cargo install --path .
-```
-
-### From crates.io (once published)
-
-```bash
-cargo install ctx-trakr
 ```
 
 Both install a binary named **`trakr`**.
