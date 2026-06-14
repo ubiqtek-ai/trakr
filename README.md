@@ -5,11 +5,10 @@ A Rust CLI (binary name: `trakr`) that tracks Claude Code context usage and esti
 ## Features
 
 - **Transcript-driven tracking** — Claude Code's native session transcripts (`~/.claude/projects/`) are the single source of truth for all spend; no OTEL pipeline required
-- **Hook integration** — `SessionStart`/`SessionEnd` hooks trigger an immediate re-parse of the transcript at session end; the serve loop re-parses every 30 s to catch sessions still in progress
 - **Cost estimation** — token counts × published Anthropic rate card, per model (Haiku / Sonnet / Opus / Fable); spend is summed from all `TokenUsage` events regardless of whether a session has ended
 - **Month-to-date spend** — aggregates all recorded sessions against a configurable monthly budget
-- **Pipeline health check** — `trakr status` checks hooks, DB freshness, and server; OTEL/env-var indicators are informational
-- **Backfill & reconciliation** — imports historical sessions from Claude Code's native logs; a 30 s reconciliation loop in `trakr serve` self-heals any missed `SessionEnd` hooks
+- **Pipeline health check** — `trakr status` checks DB freshness and server; OTEL/env-var indicators are informational
+- **Backfill & reconciliation** — imports historical sessions from Claude Code's native logs; a 30 s reconciliation loop in `trakr serve` catches sessions in progress and any sessions missed due to crash or force-quit
 - **Archive** — `trakr archive` mirrors `~/.claude/projects/` to `~/.trakr/archive/` incrementally; `trakr serve` runs this daily
 - **Runs on login** — `trakr install-service` registers a macOS LaunchAgent
 - **SQLite storage** — persistent event log, session metadata (title, summary, project), and archived transcripts
@@ -49,7 +48,6 @@ trakr init
 This does everything in one step:
 
 - Creates `~/.trakr/` with the SQLite DB (`trakr.db`), `sessions/`, `transcripts/`, `archive/`, and `config.toml`
-- Registers the `SessionStart` and `SessionEnd` hooks in `~/.claude/settings.json` (idempotent merge — your existing settings are preserved)
 - Optionally writes OTEL telemetry env vars into `~/.claude/settings.json` (see [Optional: OTEL cross-check](#optional-otel-cross-check) below — these are **not** required for accurate spend tracking)
 
 Scoping any env vars to Claude Code's settings means no shell profile changes are needed.
@@ -62,11 +60,7 @@ trakr install-service   # macOS LaunchAgent — starts now and on every login
 trakr serve
 ```
 
-### 3. Restart your Claude Code sessions
-
-Hook registrations take effect in newly started Claude Code sessions. Already-running sessions will be backfilled automatically by the reconciliation loop the next time `trakr serve` runs.
-
-### 4. Verify
+### 3. Verify
 
 ```bash
 trakr status
@@ -75,17 +69,12 @@ trakr status
 Checks the full pipeline and lists any problems with suggested fixes:
 
 ```
-Claude Code settings  (~/.claude/settings.json)
-------------------------------------------------------------
-  ✓ SessionStart hook                trakr hook session-start
-  ✓ SessionEnd hook                  trakr hook session-end
-...
   ✓ DB                               trakr.db — last activity 12s ago
   ✓ Server                           http://localhost:8788 — reachable
   i OTEL receiver                    not configured (informational only)
 ```
 
-OTEL and hook indicators marked with `i` are informational — transcript pipeline and DB freshness are the health signal.
+OTEL indicators marked with `i` are informational — DB freshness is the health signal.
 
 ---
 
@@ -155,12 +144,10 @@ set -g status-interval 30
 
 Claude Code's transcripts (`~/.claude/projects/`) are the **single source** for all spend. There is no separate OTEL pipeline for accuracy.
 
-- **`SessionEnd` hook** triggers an immediate re-parse of the transcript (`transcript_path` from the hook payload). Token usage is summed across **all** turns (deduped by `message.id`), data for that session is replaced atomically, the full transcript is archived to `~/.trakr/transcripts/`, and title/summary/last prompt are extracted into the `sessions` table.
-- **30 s reconciliation loop** in `trakr serve` re-parses all recently active transcripts, catching sessions still in progress (no `SessionEnd` hook yet) and sessions whose hook was missed due to crash or force-quit.
+- **30 s reconciliation loop** in `trakr serve` re-parses all recently active transcripts, catching sessions still in progress and any sessions missed due to crash or force-quit. This is the sole update mechanism.
 - **`trakr spend`** runs an inline sweep before reading SQLite, so the result is always current even if the server is not running.
 - **Spend is summed from all `token_usage` events** regardless of whether a session has ended — there is no completed/active split in the core accounting.
 - **Subagent files** in the same `~/.claude/projects/<slug>/` directory are included in the parse, so agent-spawned sub-sessions are counted.
-- Hook handlers always exit 0 — they never block Claude Code, even on error.
 
 ---
 
@@ -193,8 +180,8 @@ If you change `otel_port` and are using the optional OTEL cross-check, update `O
 
 | Command | Description |
 |---|---|
-| `trakr init` | Set up `~/.trakr/`, register hooks in Claude Code settings |
-| `trakr status` | Health-check: hooks, DB freshness, server reachability; OTEL/env-var checks are informational |
+| `trakr init` | Set up `~/.trakr/` (DB, directories, config) |
+| `trakr status` | Health-check: DB freshness, server reachability; OTEL/env-var checks are informational |
 | `trakr spend` | Month-to-date spend (runs inline sweep; no server required) |
 | `trakr serve` | Run the HTTP API server, 30 s reconciliation loop, and daily archive sweep in the foreground |
 | `trakr archive` | Mirror `~/.claude/projects/` → `~/.trakr/archive/` incrementally (also runs daily via `serve`) |
@@ -210,7 +197,6 @@ If you change `otel_port` and are using the optional OTEL cross-check, update `O
 | `trakr show-prompts <session-id>` | Print the user prompts from a Claude session log |
 | `trakr migrate` | Import legacy per-session JSONL files into the unified DB |
 | `trakr reset` | Clear all recorded data (prompts for confirmation) |
-| `trakr hook <event>` | Hook dispatcher used by Claude Code (`session-start`, `session-end`) |
 
 ---
 

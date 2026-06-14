@@ -8,8 +8,10 @@ pub struct Config {
     pub monthly_budget_usd: f64,
     #[serde(default = "default_api_port")]
     pub api_port: u16,
-    #[serde(default = "default_otel_port")]
-    pub otel_port: u16,
+    #[serde(default)]
+    pub api_enabled: bool,
+    #[serde(default = "default_sync_interval_secs")]
+    pub sync_interval_secs: u64,
 }
 
 fn default_budget() -> f64 {
@@ -18,8 +20,8 @@ fn default_budget() -> f64 {
 fn default_api_port() -> u16 {
     8788
 }
-fn default_otel_port() -> u16 {
-    4318
+fn default_sync_interval_secs() -> u64 {
+    30
 }
 
 impl Default for Config {
@@ -27,7 +29,8 @@ impl Default for Config {
         Config {
             monthly_budget_usd: default_budget(),
             api_port: default_api_port(),
-            otel_port: default_otel_port(),
+            api_enabled: false,
+            sync_interval_secs: default_sync_interval_secs(),
         }
     }
 }
@@ -60,13 +63,13 @@ pub fn write_default_config() -> Result<()> {
 # Monthly spend budget in USD. Shown in the status line as the denominator.
 monthly_budget_usd = 50.0
 
-# Port for the HTTP API server (GET /spend/monthly).
-api_port = 8788
+# How often the daemon re-parses Claude transcripts to update spend (seconds).
+sync_interval_secs = 30
 
-# Port for the OTLP HTTP receiver.
-# Set OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
-# and OTEL_EXPORTER_OTLP_PROTOCOL=http/json in your Claude Code environment.
-otel_port = 4318
+# HTTP API server (GET /spend/monthly). Disabled by default.
+# Enable if you want other processes (e.g. a UI) to query spend over HTTP.
+api_enabled = false
+api_port = 8788
 "#;
     std::fs::write(&path, content)?;
     Ok(())
@@ -98,7 +101,7 @@ mod tests {
             let cfg = load_config()?;
             assert_eq!(cfg.monthly_budget_usd, 50.0);
             assert_eq!(cfg.api_port, 8788);
-            assert_eq!(cfg.otel_port, 4318);
+            assert!(!cfg.api_enabled);
             Ok(())
         })
         .unwrap();

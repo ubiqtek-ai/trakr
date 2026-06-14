@@ -4,7 +4,7 @@ use chrono::{Datelike, Utc};
 
 macro_rules! tlog {
     ($($arg:tt)*) => {
-        eprintln!("{} {}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"), format_args!($($arg)*))
+        eprintln!("{} {}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S %:z"), format_args!($($arg)*))
     };
 }
 
@@ -24,7 +24,7 @@ struct ReconcileStats {
 #[command(
     name = "ctx-trakr",
     version,
-    about = "Track Claude Code context, tools, models, and agents via hooks"
+    about = "Track Claude Code context usage and estimate spend across sessions"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -38,7 +38,7 @@ enum Commands {
         /// Hook event type: tool-use | session-start | session-end
         event_type: String,
     },
-    /// Set up ~/.trakr/ and register hooks in Claude Code settings
+    /// Set up ~/.trakr/ (DB, directories, config)
     Init,
     /// List recorded sessions from the unified DB
     List,
@@ -226,124 +226,9 @@ fn cmd_init() -> Result<()> {
     println!("trakr: transcripts:        {}", transcripts.display());
     println!("trakr: archive:            {}", archive_dir.display());
     println!("trakr: config:             {}", base.join("config.toml").display());
-
-    match write_hooks_to_settings() {
-        Ok(()) => println!("trakr: hooks written to    ~/.claude/settings.json"),
-        Err(e) => {
-            println!("trakr: could not write hooks automatically: {}", e);
-            println!();
-            println!("Add the following to ~/.claude/settings.json under \"hooks\" manually:");
-            println!();
-            println!("{}", suggested_hook_config());
-        }
-    }
-
     println!();
-    println!("Run `trakr install-service` to start the OTEL receiver on login.");
-
-    Ok(())
-}
-
-fn suggested_hook_config() -> String {
-    r#"{
-  "hooks": {
-    "SessionStart": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "trakr hook session-start"
-          }
-        ]
-      }
-    ],
-    "SessionEnd": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "trakr hook session-end"
-          }
-        ]
-      }
-    ]
-  }
-}"#
-    .to_string()
-}
-
-/// Merge ctx-trakr hooks into `~/.claude/settings.json` idempotently.
-fn write_hooks_to_settings() -> Result<()> {
-    use serde_json::json;
-
-    let home = dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
-    let claude_dir = home.join(".claude");
-    std::fs::create_dir_all(&claude_dir)
-        .context("creating ~/.claude directory")?;
-    let settings_path = claude_dir.join("settings.json");
-
-    let mut settings: serde_json::Value = if settings_path.exists() {
-        let content = std::fs::read_to_string(&settings_path)
-            .context("reading ~/.claude/settings.json")?;
-        serde_json::from_str(&content).unwrap_or(json!({}))
-    } else {
-        json!({})
-    };
-
-    let to_install = [
-        ("SessionStart", "trakr hook session-start"),
-        ("SessionEnd",   "trakr hook session-end"),
-    ];
-
-    {
-        let settings_obj = settings.as_object_mut()
-            .ok_or_else(|| anyhow::anyhow!("~/.claude/settings.json is not a JSON object"))?;
-        let hooks_val = settings_obj.entry("hooks").or_insert(json!({}));
-        let hooks_obj = hooks_val.as_object_mut()
-            .ok_or_else(|| anyhow::anyhow!("hooks field is not a JSON object"))?;
-
-        for (event, command) in &to_install {
-            let arr = hooks_obj.entry(*event).or_insert(json!([]));
-            let arr = arr.as_array_mut()
-                .ok_or_else(|| anyhow::anyhow!("{} hooks is not an array", event))?;
-
-            let already = arr.iter().any(|entry| {
-                entry.get("hooks")
-                    .and_then(|v| v.as_array())
-                    .map(|hs| hs.iter().any(|h| {
-                        h.get("command").and_then(|v| v.as_str()) == Some(*command)
-                    }))
-                    .unwrap_or(false)
-            });
-
-            if !already {
-                arr.push(json!({
-                    "hooks": [{"type": "command", "command": command}]
-                }));
-            }
-        }
-
-        // Write OTEL env vars — scoped to Claude, no shell profile needed.
-        // CLAUDE_CODE_ENABLE_TELEMETRY and OTEL_METRICS_EXPORTER are required:
-        // without them Claude Code exports no telemetry at all.
-        let env_obj = settings_obj.entry("env").or_insert(json!({}));
-        let env_obj = env_obj.as_object_mut()
-            .ok_or_else(|| anyhow::anyhow!("env field is not a JSON object"))?;
-        env_obj.entry("CLAUDE_CODE_ENABLE_TELEMETRY")
-            .or_insert(json!("1"));
-        env_obj.entry("OTEL_METRICS_EXPORTER")
-            .or_insert(json!("otlp"));
-        env_obj.entry("OTEL_EXPORTER_OTLP_ENDPOINT")
-            .or_insert(json!("http://localhost:4318"));
-        env_obj.entry("OTEL_EXPORTER_OTLP_PROTOCOL")
-            .or_insert(json!("http/json"));
-    }
-
-    let json = serde_json::to_string_pretty(&settings)
-        .context("serialising settings.json")?;
-    std::fs::write(&settings_path, format!("{}\n", json))
-        .context("writing ~/.claude/settings.json")?;
+    println!("Run `trakr install-service` to start the background service.");
+    println!("Run `trakr backfill-logs` to import existing Claude sessions.");
 
     Ok(())
 }
@@ -1196,16 +1081,23 @@ fn peek_session_id(path: &std::path::Path) -> Option<String> {
     None
 }
 
-fn cmd_serve(api_port_override: Option<u16>, otel_port_override: Option<u16>) -> Result<()> {
+fn cmd_serve(api_port_override: Option<u16>, _otel_port_override: Option<u16>) -> Result<()> {
     use ctx_trakr::config;
     use ctx_trakr::otel_receiver;
     use ctx_trakr::server::{AppState, start_server};
 
     let cfg = config::load_config()?;
     let api_port = api_port_override.unwrap_or(cfg.api_port);
-    let otel_port = otel_port_override.unwrap_or(cfg.otel_port);
 
     storage::init_db()?;
+
+    let home_dir = dirs::home_dir().map(|p| p.display().to_string()).unwrap_or_else(|| "unknown".to_string());
+    tlog!("trakr: daemon starting  budget=${:.2}  sync={}s  api={}  home={}",
+        cfg.monthly_budget_usd,
+        cfg.sync_interval_secs,
+        if cfg.api_enabled { format!("enabled (:{} )", cfg.api_port) } else { "disabled".to_string() },
+        home_dir,
+    );
 
     let rt = tokio::runtime::Runtime::new().context("creating tokio runtime")?;
     rt.block_on(async move {
@@ -1216,24 +1108,22 @@ fn cmd_serve(api_port_override: Option<u16>, otel_port_override: Option<u16>) ->
             budget_usd: cfg.monthly_budget_usd,
         };
 
-        // B3: spawn the reconciliation sweep as a background task.
-        // Runs once at startup and then every 30 s. Uses spawn_blocking because the sweep
-        // is synchronous / CPU-bound (file I/O + SQLite). No synthetic session_end is written
-        // so re-parsing a live session is harmless and self-healing.
+        let sync_interval = cfg.sync_interval_secs;
+
         tokio::spawn(async move {
             loop {
                 let result = tokio::task::spawn_blocking(run_log_reconciliation).await;
                 match result {
-                    Ok(Err(e)) => tlog!("trakr: reconciliation warning: {:#}", e),
-                    Err(e)    => tlog!("trakr: reconciliation task panicked: {:#}", e),
+                    Ok(Err(e)) => tlog!("trakr: sync warning: {:#}", e),
+                    Err(e)    => tlog!("trakr: sync task panicked: {:#}", e),
                     Ok(Ok(stats)) => {
                         if stats.n_new > 0 || stats.n_updated > 0 {
-                            tlog!("trakr: reconcile: {} new, {} updated, {} unchanged",
+                            tlog!("trakr: syncing: {} new, {} updated, {} unchanged",
                                 stats.n_new, stats.n_updated, stats.n_unchanged);
                         }
                     }
                 }
-                tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+                tokio::time::sleep(tokio::time::Duration::from_secs(sync_interval)).await;
             }
         });
 
@@ -1269,10 +1159,22 @@ fn cmd_serve(api_port_override: Option<u16>, otel_port_override: Option<u16>) ->
             }
         });
 
-        tokio::join!(
-            start_server(api_port, state),
-            otel_receiver::start_otel_receiver(otel_port, costs),
-        );
+        tokio::spawn(async {
+            use tokio::signal::unix::{signal, SignalKind};
+            if let Ok(mut sig) = signal(SignalKind::terminate()) {
+                sig.recv().await;
+                tlog!("trakr: daemon stopping");
+                std::process::exit(0);
+            }
+        });
+
+        if cfg.api_enabled {
+            start_server(api_port, state).await;
+            tlog!("trakr: daemon stopping");
+        } else {
+            // API disabled — park the runtime so the background loops keep running.
+            std::future::pending::<()>().await;
+        }
     });
 
     Ok(())
@@ -1381,7 +1283,6 @@ fn cmd_status() -> Result<()> {
     let mut problems: Vec<String> = Vec::new();
 
     let ok = |good: bool| if good { "✓" } else { "✗" };
-    // B4: info items are printed but never counted in problems.
     let info = |_: bool| "ℹ";
 
     // ── Transcripts pipeline (health signals) ──────────────────────────────────
@@ -1445,9 +1346,9 @@ fn cmd_status() -> Result<()> {
     println!("{}", "-".repeat(60));
 
     let config_exists = config::config_path()?.exists();
-    println!("  {} {:<32} budget ${:.2}, api :{}, otel :{}{}",
+    println!("  {} {:<32} budget ${:.2}, api :{}{}",
         ok(config_exists), "config.toml",
-        cfg.monthly_budget_usd, cfg.api_port, cfg.otel_port,
+        cfg.monthly_budget_usd, cfg.api_port,
         if config_exists { "" } else { "  (file missing — using defaults)" });
 
     let transcripts_dir = base.join("transcripts");
@@ -1461,75 +1362,22 @@ fn cmd_status() -> Result<()> {
     // ── Server (informational) ─────────────────────────────────────────────────
 
     println!();
-    println!("Server  (informational — spend does not depend on this)");
+    println!("Service  (reconciliation loop — keeps DB current every 30 s)");
     println!("{}", "-".repeat(60));
 
     let plist_installed = launch_agent_plist_path().map(|p| p.exists()).unwrap_or(false);
     println!("  {} {:<32} {}", info(plist_installed), "launchd service",
         if plist_installed { LAUNCH_AGENT_LABEL } else { "not installed — run `trakr install-service`" });
 
-    let api_base = format!("http://127.0.0.1:{}", cfg.api_port);
-    let api_up = try_get(&format!("{}/spend/monthly", api_base)).is_some();
-    println!("  {} {:<32} {}", info(api_up), "API server",
-        if api_up { format!("{} (responding)", api_base) }
-        else { format!("{} not responding — run `trakr serve` (optional)", api_base) });
-    // B4: server not running is no longer a problem — spend works via SQLite alone.
-
-    // ── Claude Code settings (informational) ──────────────────────────────────
-
-    println!();
-    println!("Claude Code settings  (~/.claude/settings.json)  [informational]");
-    println!("{}", "-".repeat(60));
-
-    let settings: serde_json::Value = std::fs::read_to_string(home.join(".claude").join("settings.json"))
-        .ok()
-        .and_then(|c| serde_json::from_str(&c).ok())
-        .unwrap_or(serde_json::Value::Null);
-
-    let hook_installed = |event: &str, command: &str| -> bool {
-        settings.get("hooks")
-            .and_then(|h| h.get(event))
-            .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().any(|entry| {
-                entry.get("hooks")
-                    .and_then(|v| v.as_array())
-                    .map(|hs| hs.iter().any(|h| {
-                        h.get("command").and_then(|v| v.as_str()) == Some(command)
-                    }))
-                    .unwrap_or(false)
-            }))
-            .unwrap_or(false)
-    };
-
-    for (event, command) in [
-        ("SessionStart", "trakr hook session-start"),
-        ("SessionEnd",   "trakr hook session-end"),
-    ] {
-        let installed = hook_installed(event, command);
-        println!("  {} {:<32} {}", info(installed), format!("{} hook", event),
-            if installed { command } else { "not registered (run `trakr init` to add)" });
-        // B4: hooks are informational — session_end hook is parked; spend uses transcripts.
-    }
-
-    // OTEL env vars — informational only.
-    let env = settings.get("env");
-    let otel_port_str = format!("http://localhost:{}", cfg.otel_port);
-    let expected_env: &[(&str, &str)] = &[
-        ("CLAUDE_CODE_ENABLE_TELEMETRY", "1"),
-        ("OTEL_METRICS_EXPORTER",        "otlp"),
-        ("OTEL_EXPORTER_OTLP_ENDPOINT",  &otel_port_str),
-        ("OTEL_EXPORTER_OTLP_PROTOCOL",  "http/json"),
-    ];
-    for (key, expected) in expected_env {
-        let actual = env.and_then(|e| e.get(*key)).and_then(|v| v.as_str());
-        let good = actual == Some(*expected);
-        let shown = match actual {
-            Some(v) if good => v.to_string(),
-            Some(v) => format!("{}  (expected {})", v, expected),
-            None => format!("not set  (expected {})", expected),
-        };
-        println!("  {} {:<32} {}", info(good), key, shown);
-        // B4: OTEL env vars are informational — not counted in problems.
+    if cfg.api_enabled {
+        let api_base = format!("http://127.0.0.1:{}", cfg.api_port);
+        let api_up = try_get(&format!("{}/spend/monthly", api_base)).is_some();
+        println!("  {} {:<32} {}", info(api_up), "API server",
+            if api_up { format!("{} (responding)", api_base) }
+            else { format!("{} not responding", api_base) });
+    } else {
+        println!("  {} {:<32} disabled (set api_enabled = true in config.toml to enable)",
+            info(false), "API server");
     }
 
     // ── Summary ────────────────────────────────────────────────────────────────
