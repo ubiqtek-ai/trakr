@@ -667,6 +667,130 @@ pub fn set_session_last_activity(session_id: &str, last_activity_at: &str) -> Re
     Ok(())
 }
 
+/// Lightweight metadata for one session — used by `inspect-logs` display.
+pub struct SessionMeta {
+    pub session_id: String,
+    pub project_path: Option<String>,
+    pub title: Option<String>,
+    /// RFC3339 string from `sessions.last_activity_at`.
+    pub last_activity_at: Option<String>,
+    /// RFC3339 string from `sessions.file_mtime` (mtime at time of last parse).
+    pub file_mtime: Option<String>,
+    pub model: Option<String>,
+}
+
+/// Return all sessions ordered by `last_activity_at` descending (most recent first).
+pub fn get_all_sessions_meta() -> Result<Vec<SessionMeta>> {
+    let conn = open_db()?;
+    let mut stmt = conn.prepare(
+        "SELECT session_id, project_path, title, last_activity_at, file_mtime, model \
+         FROM sessions ORDER BY last_activity_at DESC NULLS LAST",
+    )
+    .context("preparing get_all_sessions_meta query")?;
+
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(SessionMeta {
+                session_id:       row.get::<_, String>(0)?,
+                project_path:     row.get::<_, Option<String>>(1)?,
+                title:            row.get::<_, Option<String>>(2)?,
+                last_activity_at: row.get::<_, Option<String>>(3)?,
+                file_mtime:       row.get::<_, Option<String>>(4)?,
+                model:            row.get::<_, Option<String>>(5)?,
+            })
+        })
+        .context("querying session meta")?
+        .collect::<Result<Vec<_>, _>>()
+        .context("reading session meta rows")?;
+
+    Ok(rows)
+}
+
+/// Compute the per-session spend in USD by summing all `token_usage` events.
+///
+/// Returns a `HashMap<session_id, total_usd>`.  Sessions with no token_usage events
+/// are absent from the map (not present with a zero value).
+pub fn get_spend_by_session() -> Result<std::collections::HashMap<String, f64>> {
+    use crate::cost::compute_cost_usd;
+
+    let conn = open_db()?;
+    let mut stmt = conn.prepare(
+        "SELECT session_id, payload FROM events WHERE event_type = 'token_usage'",
+    )
+    .context("preparing get_spend_by_session query")?;
+
+    let rows: Vec<(String, String)> = stmt
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+        .context("querying token_usage events")?
+        .collect::<Result<Vec<_>, _>>()
+        .context("reading token_usage rows")?;
+
+    let mut map: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+
+    for (session_id, payload) in rows {
+        let Ok(event) = serde_json::from_str::<crate::event::Event>(&payload) else { continue };
+        if let crate::event::Event::TokenUsage {
+            model,
+            input_tokens,
+            output_tokens,
+            cache_creation_input_tokens,
+            cache_read_input_tokens,
+            ..
+        } = event
+        {
+            *map.entry(session_id).or_insert(0.0) += compute_cost_usd(
+                &model,
+                input_tokens,
+                output_tokens,
+                cache_creation_input_tokens,
+                cache_read_input_tokens,
+            );
+        }
+    }
+
+    Ok(map)
+}
+
+/// Sum ALL `token_usage` events across every session.
+pub fn get_total_spend_usd() -> Result<f64> {
+    use crate::cost::compute_cost_usd;
+
+    let conn = open_db()?;
+    let mut stmt = conn
+        .prepare("SELECT payload FROM events WHERE event_type = 'token_usage'")
+        .context("preparing get_total_spend_usd query")?;
+
+    let payloads: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .context("querying all token_usage payloads")?
+        .collect::<Result<Vec<_>, _>>()
+        .context("reading token_usage payload rows")?;
+
+    let mut total = 0.0f64;
+    for payload in payloads {
+        let Ok(event) = serde_json::from_str::<crate::event::Event>(&payload) else { continue };
+        if let crate::event::Event::TokenUsage {
+            model,
+            input_tokens,
+            output_tokens,
+            cache_creation_input_tokens,
+            cache_read_input_tokens,
+            ..
+        } = event
+        {
+            total += compute_cost_usd(
+                &model,
+                input_tokens,
+                output_tokens,
+                cache_creation_input_tokens,
+                cache_read_input_tokens,
+            );
+        }
+    }
+
+    Ok(total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

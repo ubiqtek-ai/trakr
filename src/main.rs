@@ -7,6 +7,13 @@ use ctx_trakr::backfill;
 use ctx_trakr::hooks;
 use ctx_trakr::storage;
 
+/// Stats returned by `run_log_reconciliation`.
+struct ReconcileStats {
+    pub n_new: usize,
+    pub n_updated: usize,
+    pub n_unchanged: usize,
+}
+
 #[derive(Parser)]
 #[command(
     name = "ctx-trakr",
@@ -105,6 +112,8 @@ enum Commands {
     UninstallService,
     /// Copy Claude transcripts from ~/.claude/projects/ into ~/.trakr/archive/ (incremental)
     Archive,
+    /// Manually trigger a session-log reconciliation and print a summary
+    Sync,
 }
 
 fn main() {
@@ -140,6 +149,7 @@ fn run(cli: Cli) -> Result<()> {
         Commands::InstallService => cmd_install_service(),
         Commands::UninstallService => cmd_uninstall_service(),
         Commands::Archive => cmd_archive(),
+        Commands::Sync => cmd_sync(),
     }
 }
 
@@ -928,88 +938,162 @@ fn cmd_inspect_logs(project: Option<&str>, since: Option<&str>, verbose: bool) -
         })
         .transpose()?;
 
-    let summaries = backfill::inspect_logs(&projects_dir, project, since_date)?;
+    // ── Discover log files ────────────────────────────────────────────────────
 
-    use ctx_trakr::backfill::TrackingStatus;
+    let log_paths = backfill::discover_sessions(&projects_dir, project, since_date)?;
+    let n_log_files = log_paths.len();
 
-    // ── Claude logs section ────────────────────────────────────────────────────
+    // Build a map: session_id → (PathBuf, file_mtime_rfc3339)
+    // We need the mtime for sync-status comparison and the date-range display.
+    let mut log_file_map: std::collections::HashMap<String, (std::path::PathBuf, Option<String>)> =
+        std::collections::HashMap::new();
 
-    let log_count = summaries.len();
-    let log_earliest = summaries.iter().filter_map(|s| s.first_ts).min();
-    let log_latest = summaries.iter().filter_map(|s| s.last_ts).max();
-    let n_complete = summaries.iter().filter(|s| s.tracking == TrackingStatus::Complete).count();
-    let n_partial  = summaries.iter().filter(|s| s.tracking == TrackingStatus::Partial).count();
-    let n_missing  = summaries.iter().filter(|s| s.tracking == TrackingStatus::Missing).count();
+    let mut earliest_mtime: Option<chrono::DateTime<Utc>> = None;
+    let mut latest_mtime:   Option<chrono::DateTime<Utc>> = None;
 
-    println!("Claude Code session logs  ({})", projects_dir.display());
-    println!("{}", "-".repeat(55));
-    if log_count == 0 {
-        println!("  No session logs found.");
-    } else {
-        println!("  Sessions:    {}", log_count);
-        println!("  Date range:  {}  →  {}",
-            log_earliest.map(|t| t.format("%Y-%m-%d").to_string()).unwrap_or_else(|| "unknown".to_string()),
-            log_latest.map(|t| t.format("%Y-%m-%d").to_string()).unwrap_or_else(|| "unknown".to_string()),
-        );
-        println!("  Complete:    {}  (fully tracked by hooks)", n_complete);
-        println!("  Partial:     {}  (hooks ran but session_start or session_end missing)", n_partial);
-        println!("  Missing:     {}  (not in DB at all — backfill-logs would add these)", n_missing);
+    for path in &log_paths {
+        let sid = match peek_session_id(path) {
+            Some(s) => s,
+            None => continue,
+        };
+        let mtime_opt: Option<String> = std::fs::metadata(path)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .map(|t| {
+                let dt: chrono::DateTime<Utc> = t.into();
+                if earliest_mtime.map_or(true, |e| dt < e) { earliest_mtime = Some(dt); }
+                if latest_mtime.map_or(true,   |l| dt > l) { latest_mtime   = Some(dt); }
+                dt.to_rfc3339()
+            });
+        log_file_map.insert(sid, (path.clone(), mtime_opt));
     }
 
-    // ── ctx-trakr DB section ───────────────────────────────────────────────────
+    // ── DB sessions ───────────────────────────────────────────────────────────
 
-    println!();
-    println!("ctx-trakr DB  (~/.trakr/trakr.db)");
-    println!("{}", "-".repeat(55));
-    match storage::get_db_summary()? {
-        None => {
-            println!("  DB is empty or does not exist.");
-        }
-        Some((db_earliest, db_latest, db_count)) => {
-            // Sessions in DB that have no corresponding log file (logs pruned by Claude Code).
-            let in_logs: std::collections::HashSet<&str> =
-                summaries.iter().map(|s| s.session_id.as_str()).collect();
-            let db_ids: std::collections::HashSet<String> = storage::get_sessions()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(id, _)| id)
-                .collect();
-            let logs_pruned = db_ids.iter().filter(|id| !in_logs.contains(id.as_str())).count();
+    let db_sessions = storage::get_all_sessions_meta().unwrap_or_default();
+    let db_session_ids: std::collections::HashSet<&str> =
+        db_sessions.iter().map(|s| s.session_id.as_str()).collect();
 
-            println!("  Sessions:    {}", db_count);
-            println!("  Date range:  {}  →  {}",
-                db_earliest.format("%Y-%m-%d"),
-                db_latest.format("%Y-%m-%d"),
-            );
-            if logs_pruned > 0 {
-                println!("  No log file: {} session(s) in DB with no corresponding Claude log (project deleted or log pruned)", logs_pruned);
-            }
-        }
-    }
+    // Counts for the summary block.
+    let n_in_db = log_file_map.keys()
+        .filter(|sid| db_session_ids.contains(sid.as_str()))
+        .count();
 
-    // ── verbose: per-session list ──────────────────────────────────────────────
-
-    if verbose && log_count > 0 {
-        println!();
-        println!("{:<36}  {}  {:>8}  {}",
-            "session", "date      ", "tracking", "project");
-        println!("{}", "-".repeat(90));
-
-        for s in &summaries {
-            let date = s.first_ts
-                .map(|t| t.format("%Y-%m-%d").to_string())
-                .unwrap_or_else(|| "unknown   ".to_string());
-            let status = match s.tracking {
-                TrackingStatus::Complete => "complete",
-                TrackingStatus::Partial  => "partial ",
-                TrackingStatus::Missing  => "missing ",
-            };
-            let short_project = if s.project.len() > 36 {
-                format!("{}...", &s.project[..33])
+    // Stale: in DB, file has changed since last parse (file_mtime differs from stored).
+    let n_stale = db_sessions.iter()
+        .filter(|s| {
+            if let Some((_, current_mtime)) = log_file_map.get(&s.session_id) {
+                match (&s.file_mtime, current_mtime) {
+                    (Some(stored), Some(current)) => stored != current,
+                    (Some(_), None) => false, // can't read file mtime — not stale
+                    (None, Some(_)) => false,  // file_mtime NULL → never parsed → "new"
+                    (None, None) => false,
+                }
             } else {
-                s.project.clone()
+                false // not in log_file_map → orphaned, not stale
+            }
+        })
+        .count();
+
+    // New: log file exists but session is not in DB at all.
+    let n_new_files = log_file_map.keys()
+        .filter(|sid| !db_session_ids.contains(sid.as_str()))
+        .count();
+
+    // Orphaned: in DB but no corresponding log file.
+    let n_orphaned = db_sessions.iter()
+        .filter(|s| !log_file_map.contains_key(&s.session_id))
+        .count();
+
+    // ── Spend ─────────────────────────────────────────────────────────────────
+
+    let total_spend = storage::get_total_spend_usd().unwrap_or(0.0);
+    let year_month = Utc::now().format("%Y-%m").to_string();
+    let (month_spend, _) = storage::get_monthly_spend_usd(&year_month).unwrap_or((0.0, 0));
+    let month_label = chrono::Local::now().format("%B %Y").to_string();
+
+    // ── Summary block ─────────────────────────────────────────────────────────
+
+    const W: usize = 49;
+    let date_range = match (earliest_mtime, latest_mtime) {
+        (Some(e), Some(l)) => format!(
+            "({} → {})",
+            e.format("%-d %b %Y"),
+            l.format("%-d %b %Y"),
+        ),
+        _ => String::new(),
+    };
+
+    println!("Session logs  ({})", projects_dir.display());
+    println!("{}", "─".repeat(W));
+    println!("  {:<16} {:>5}   {}", "Log files", n_log_files, date_range);
+    println!("  {:<16} {:>5}", "In DB", n_in_db);
+    println!("  {:<16} {:>5}   {}", "Stale", n_stale,
+        if n_stale > 0 { "(file changed since last parse)" } else { "" });
+    println!("  {:<16} {:>5}   {}", "New", n_new_files,
+        if n_new_files > 0 { "(log files not yet in DB)" } else { "" });
+    println!("  {:<16} {:>5}   {}", "Orphaned", n_orphaned,
+        if n_orphaned > 0 { "(in DB, log file missing)" } else { "" });
+    println!();
+    println!("  {:<24} ${:.2}", "Spend (all time)", total_spend);
+    println!("  {:<24} ${:.2}", format!("Spend ({})", month_label), month_spend);
+
+    // ── Verbose: per-session table ────────────────────────────────────────────
+
+    if verbose {
+        // Collect spend map.
+        let spend_map = storage::get_spend_by_session().unwrap_or_default();
+
+        println!();
+        println!("{:<10}  {:<24}  {:<30}  {:<8}  {}",
+            "Date", "Project", "Title", "Spend", "Sync");
+        println!("{}", "─".repeat(82));
+
+        for s in &db_sessions {
+            // Determine date from last_activity_at.
+            let date = s.last_activity_at.as_deref()
+                .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
+                .map(|dt| dt.format("%Y-%m-%d").to_string())
+                .unwrap_or_else(|| "unknown   ".to_string());
+
+            // Project: last path component of project_path, truncated to 24 chars.
+            let project_raw = s.project_path.as_deref().unwrap_or("");
+            let project_display = {
+                let last = project_raw.rsplit('/').next().unwrap_or(project_raw);
+                if last.len() > 24 { &last[..24] } else { last }
             };
-            println!("{}  {}  {}  {}", s.session_id, date, status, short_project);
+
+            // Title: truncate to 30 chars or show placeholder.
+            let title_display = match &s.title {
+                Some(t) => {
+                    if t.chars().count() > 30 {
+                        let truncated: String = t.chars().take(27).collect();
+                        format!("{}...", truncated)
+                    } else {
+                        t.clone()
+                    }
+                }
+                None => "(no title)".to_string(),
+            };
+
+            // Spend.
+            let spend = spend_map.get(&s.session_id).copied().unwrap_or(0.0);
+            let spend_display = format!("${:.2}", spend);
+
+            // Sync status.
+            let sync_status = if let Some((_, current_mtime)) = log_file_map.get(&s.session_id) {
+                match (&s.file_mtime, current_mtime) {
+                    (Some(stored), Some(current)) if stored == current => "✓",
+                    (Some(_), Some(_)) => "stale",
+                    (None, Some(_)) => "new",
+                    _ => "?",
+                }
+            } else {
+                "gone"
+            };
+
+            println!("{:<10}  {:<24}  {:<30}  {:<8}  {}",
+                date, project_display, title_display, spend_display, sync_status);
         }
     }
 
@@ -1026,19 +1110,19 @@ fn cmd_inspect_logs(project: Option<&str>, since: Option<&str>, verbose: bool) -
 /// B3 change detection: the main file's (size, mtime) and composite subagent totals are
 /// compared against what is stored in `sessions.file_size` / `sessions.file_mtime`. If nothing
 /// changed, that session is skipped. After a successful parse+replace the columns are updated.
-fn run_log_reconciliation() -> Result<()> {
+fn run_log_reconciliation() -> Result<ReconcileStats> {
     use backfill::BackfillAction;
 
     let home = dirs::home_dir()
         .ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
     let projects_dir = home.join(".claude").join("projects");
     if !projects_dir.exists() {
-        return Ok(());
+        return Ok(ReconcileStats { n_new: 0, n_updated: 0, n_unchanged: 0 });
     }
 
     let paths = backfill::discover_sessions(&projects_dir, None, None)?;
     let mut n_new = 0usize;
-    let mut n_replaced = 0usize;
+    let mut n_updated = 0usize;
     let mut n_unchanged = 0usize;
 
     for path in &paths {
@@ -1066,7 +1150,7 @@ fn run_log_reconciliation() -> Result<()> {
                     update_file_meta_for_path(&session.session_id, path, &session.last_activity_at);
                 }
                 Ok(BackfillAction::Replaced) => {
-                    n_replaced += 1;
+                    n_updated += 1;
                     update_file_meta_for_path(&session.session_id, path, &session.last_activity_at);
                 }
                 _ => {}
@@ -1074,9 +1158,7 @@ fn run_log_reconciliation() -> Result<()> {
         }
     }
 
-    let _ = (n_new, n_replaced, n_unchanged);
-
-    Ok(())
+    Ok(ReconcileStats { n_new, n_updated, n_unchanged })
 }
 
 /// Read only the first non-empty line of a JSONL file and extract the `sessionId` field.
@@ -1131,7 +1213,7 @@ fn cmd_serve(api_port_override: Option<u16>, otel_port_override: Option<u16>) ->
                 match result {
                     Ok(Err(e)) => eprintln!("trakr: reconciliation warning: {:#}", e),
                     Err(e)    => eprintln!("trakr: reconciliation task panicked: {:#}", e),
-                    Ok(Ok(())) => {}
+                    Ok(Ok(_)) => {}
                 }
                 tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
             }
@@ -1193,6 +1275,7 @@ fn cmd_spend() -> Result<()> {
     if let Err(e) = run_log_reconciliation() {
         eprintln!("trakr: reconciliation warning: {:#}", e);
     }
+    // Stats from the inline sweep are intentionally discarded here.
 
     let (spent, count) = storage::get_monthly_spend_usd(&year_month)?;
     let now_local = chrono::Local::now();
@@ -1210,24 +1293,48 @@ fn cmd_spend() -> Result<()> {
         now_local.format("%:z"),
     );
 
-    // Value column is 10 chars. Monetary values right-aligned as $NNN.NN.
-    // Sessions (integer) is right-padded with 3 spaces so its units digit aligns
-    // with the units digit of monetary values (one column left of the decimal point).
     const LW: usize = 12;
     const VW: usize = 10;
     const W: usize = 2 + LW + 1 + VW;
-    let sessions_val = format!("{:>width$}   ", count, width = VW - 3);
-    let cost_val     = format!("{:>width$}", format!("${:.2}", spent),                  width = VW);
-    let budget_val   = format!("{:>width$}", format!("${:.2}", cfg.monthly_budget_usd), width = VW);
-    let used_val     = format!("{:>width$}", format!("{:.1}%", pct),                    width = VW);
+    let cost_val   = format!("{:>width$}", format!("${:.2}", spent),                  width = VW);
+    let budget_val = format!("{:>width$}", format!("${:.2}", cfg.monthly_budget_usd), width = VW);
+    let used_val   = format!("{:>width$}", format!("{:.1}%", pct),                    width = VW);
 
-    println!("Spend for {}", month_label);
+    println!("Spend for {} ({} sessions)", month_label, count);
     println!("{}", "-".repeat(W));
-    println!("  {:<width$} {}", "Sessions", sessions_val, width = LW);
-    println!("  {:<width$} {}", "Cost",     cost_val,     width = LW);
-    println!("  {:<width$} {}", "Budget",   budget_val,   width = LW);
-    println!("  {:<width$} {}", "Used",     used_val,     width = LW);
+    println!("  {:<width$} {}", "Cost",   cost_val,   width = LW);
+    println!("  {:<width$} {}", "Budget", budget_val, width = LW);
+    println!("  {:<width$} {}", "Used",   used_val,   width = LW);
     println!("{}", "-".repeat(W));
+    println!("Last updated: {}", human_ts);
+
+    Ok(())
+}
+
+fn cmd_sync() -> Result<()> {
+    storage::init_db()?;
+
+    println!("Syncing session logs...");
+
+    let stats = run_log_reconciliation()?;
+
+    println!(
+        "  Reconciled: {} new, {} updated, {} unchanged",
+        stats.n_new, stats.n_updated, stats.n_unchanged
+    );
+
+    let now_local = chrono::Local::now();
+    let day = now_local.day();
+    let suffix = match day % 100 {
+        11 | 12 | 13 => "th",
+        _ => match day % 10 { 1 => "st", 2 => "nd", 3 => "rd", _ => "th" },
+    };
+    let human_ts = format!("{}{} {} @ {} ({})",
+        day, suffix,
+        now_local.format("%B %Y"),
+        now_local.format("%H:%M:%S"),
+        now_local.format("%:z"),
+    );
     println!("Last updated: {}", human_ts);
 
     Ok(())

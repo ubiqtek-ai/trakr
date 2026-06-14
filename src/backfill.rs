@@ -402,7 +402,7 @@ pub fn parse_session_log(path: &Path) -> Result<Option<BackfilledSession>> {
         match entry_type {
             Some("ai-title") => {
                 if title.is_none() {
-                    title = entry.get("title").and_then(|v| v.as_str()).map(|s| s.to_string());
+                    title = entry.get("aiTitle").and_then(|v| v.as_str()).map(|s| s.to_string());
                 }
             }
             Some("last-prompt") => {
@@ -540,149 +540,6 @@ pub fn backfill_session(session: &BackfilledSession, dry_run: bool) -> Result<Ba
     }
 
     Ok(action)
-}
-
-/// How well a Claude log session is represented in the ctx-trakr DB.
-#[derive(Debug, PartialEq)]
-pub enum TrackingStatus {
-    /// No events in the DB for this session.
-    Missing,
-    /// Some events exist but the session lacks either a `session_start` or `session_end`.
-    Partial,
-    /// Has both `session_start` and `session_end` — fully tracked.
-    Complete,
-}
-
-/// A summary of one session as seen in Claude Code's native logs.
-pub struct SessionSummary {
-    pub session_id: String,
-    pub project: String,
-    pub first_ts: Option<DateTime<Utc>>,
-    pub last_ts: Option<DateTime<Utc>>,
-    pub assistant_turns: usize,
-    pub tool_uses: usize,
-    pub model: Option<String>,
-    pub tracking: TrackingStatus,
-}
-
-/// Read all Claude Code native session logs under `projects_dir` and return a summary of each.
-///
-/// Does not write anything. `project_filter` and `since` work the same as in `discover_sessions`.
-pub fn inspect_logs(
-    projects_dir: &Path,
-    project_filter: Option<&str>,
-    since: Option<NaiveDate>,
-) -> Result<Vec<SessionSummary>> {
-    let completed = storage::get_completed_session_ids().unwrap_or_default();
-    let started = storage::get_started_session_ids().unwrap_or_default();
-    let db_session_ids: std::collections::HashSet<String> = storage::get_sessions()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(id, _)| id)
-        .collect();
-
-    let paths = discover_sessions(projects_dir, project_filter, since)?;
-    let mut summaries = Vec::new();
-
-    for path in &paths {
-        let project = path
-            .parent()
-            .and_then(|p| p.file_name())
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown")
-            .to_string();
-
-        let contents = match std::fs::read_to_string(path) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-
-        let mut session_id: Option<String> = None;
-        let mut first_ts: Option<DateTime<Utc>> = None;
-        let mut last_ts: Option<DateTime<Utc>> = None;
-        let mut assistant_turns = 0usize;
-        let mut tool_uses = 0usize;
-        let mut model: Option<String> = None;
-
-        for line in contents.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
-                continue;
-            };
-
-            if session_id.is_none() {
-                session_id = entry.get("sessionId").and_then(|v| v.as_str()).map(|s| s.to_string());
-            }
-
-            let ts = entry
-                .get("timestamp")
-                .and_then(|v| v.as_str())
-                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-                .map(|dt| dt.with_timezone(&Utc));
-
-            if let Some(t) = ts {
-                if first_ts.is_none() {
-                    first_ts = Some(t);
-                }
-                last_ts = Some(t);
-            }
-
-            if entry.get("type").and_then(|v| v.as_str()) == Some("assistant") {
-                assistant_turns += 1;
-                if let Some(msg) = entry.get("message") {
-                    if model.is_none() {
-                        if let Some(m) = msg.get("model").and_then(|v| v.as_str()) {
-                            if !m.is_empty() {
-                                model = Some(m.to_string());
-                            }
-                        }
-                    }
-                    if let Some(content) = msg.get("content").and_then(|v| v.as_array()) {
-                        tool_uses += content
-                            .iter()
-                            .filter(|b| b.get("type").and_then(|v| v.as_str()) == Some("tool_use"))
-                            .count();
-                    }
-                }
-            }
-        }
-
-        let sid = match session_id {
-            Some(s) => s,
-            None => continue,
-        };
-
-        let tracking = if !db_session_ids.contains(&sid) {
-            TrackingStatus::Missing
-        } else if started.contains(&sid) && completed.contains(&sid) {
-            TrackingStatus::Complete
-        } else {
-            TrackingStatus::Partial
-        };
-
-        summaries.push(SessionSummary {
-            session_id: sid,
-            project,
-            first_ts,
-            last_ts,
-            assistant_turns,
-            tool_uses,
-            model,
-            tracking,
-        });
-    }
-
-    summaries.sort_by(|a, b| match (a.first_ts, b.first_ts) {
-        (Some(a), Some(b)) => a.cmp(&b),
-        (Some(_), None) => std::cmp::Ordering::Less,
-        (None, Some(_)) => std::cmp::Ordering::Greater,
-        (None, None) => std::cmp::Ordering::Equal,
-    });
-
-    Ok(summaries)
 }
 
 /// Parse an ISO 8601 timestamp from a JSON entry's `timestamp` field.
@@ -843,7 +700,7 @@ mod tests {
     fn test_parse_title_and_summary_extracted() -> Result<()> {
         let tmp = TempDir::new()?;
         let content = r#"{"type":"system","sessionId":"recap1","timestamp":"2026-01-01T10:00:00Z"}
-{"type":"ai-title","sessionId":"recap1","timestamp":"2026-01-01T10:01:00Z","title":"Implement transcript archiving"}
+{"type":"ai-title","sessionId":"recap1","timestamp":"2026-01-01T10:01:00Z","aiTitle":"Implement transcript archiving"}
 {"type":"user","sessionId":"recap1","timestamp":"2026-01-01T10:02:00Z","isCompactSummary":true,"message":{"role":"user","content":"This session is being continued. Summary: work in progress."}}
 {"type":"last-prompt","sessionId":"recap1","timestamp":"2026-01-01T10:03:00Z","prompt":"update the plan"}
 "#;
