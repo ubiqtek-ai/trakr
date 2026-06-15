@@ -1298,29 +1298,48 @@ fn cmd_spend(json: bool) -> Result<()> {
 
     storage::init_db()?;
 
-    let (background, bg_calls) = if cfg.otel_enabled {
-        storage::get_monthly_background_spend_usd(&year_month).unwrap_or((0.0, 0))
-    } else {
-        (0.0, 0)
-    };
-
     let adjustment = storage::get_monthly_adjustment_usd(&year_month).unwrap_or(0.0);
+
+    // Helper that resolves the background figure and its source label given transcript spend.
+    // Priority: real OTEL data (if enabled and non-zero) > fudge factor > zero.
+    enum BgSource { Otel(usize), Estimate(f64), None }
+    let resolve_background = |spent: f64| -> (f64, BgSource) {
+        if cfg.otel_enabled {
+            let (usd, calls) = storage::get_monthly_background_spend_usd(&year_month)
+                .unwrap_or((0.0, 0));
+            if calls > 0 {
+                return (usd, BgSource::Otel(calls));
+            }
+        }
+        if cfg.background_factor > 0.0 {
+            (spent * cfg.background_factor, BgSource::Estimate(cfg.background_factor))
+        } else {
+            (0.0, BgSource::None)
+        }
+    };
 
     if json {
         // Fast path: DB read only, no reconciliation. The serve daemon keeps the DB current.
         let (spent, count) = storage::get_monthly_spend_usd(&year_month)?;
+        let (background, bg_src) = resolve_background(spent);
         let total = spent + background + adjustment;
         let pct = if cfg.monthly_budget_usd > 0.0 { total / cfg.monthly_budget_usd * 100.0 } else { 0.0 };
+        let bg_source_str = match &bg_src {
+            BgSource::Otel(_)      => "otel",
+            BgSource::Estimate(_)  => "estimate",
+            BgSource::None         => "none",
+        };
         println!(
-            r#"{{"month":"{month}","spent_usd":{spent:.2},"background_usd":{background:.2},"adjustment_usd":{adjustment:.2},"total_usd":{total:.2},"budget_usd":{budget:.2},"pct":{pct:.1},"sessions":{count}}}"#,
-            month      = year_month,
-            spent      = spent,
-            background = background,
-            adjustment = adjustment,
-            total      = total,
-            budget     = cfg.monthly_budget_usd,
-            pct        = pct,
-            count      = count,
+            r#"{{"month":"{month}","spent_usd":{spent:.2},"background_usd":{background:.2},"background_source":"{bg_source_str}","adjustment_usd":{adjustment:.2},"total_usd":{total:.2},"budget_usd":{budget:.2},"pct":{pct:.1},"sessions":{count}}}"#,
+            month          = year_month,
+            spent          = spent,
+            background     = background,
+            bg_source_str  = bg_source_str,
+            adjustment     = adjustment,
+            total          = total,
+            budget         = cfg.monthly_budget_usd,
+            pct            = pct,
+            count          = count,
         );
         return Ok(());
     }
@@ -1331,6 +1350,7 @@ fn cmd_spend(json: bool) -> Result<()> {
     }
 
     let (spent, count) = storage::get_monthly_spend_usd(&year_month)?;
+    let (background, bg_src) = resolve_background(spent);
     let total = spent + background + adjustment;
     let now_local = chrono::Local::now();
     let month_label = now_local.format("%B %Y").to_string();
@@ -1359,11 +1379,19 @@ fn cmd_spend(json: bool) -> Result<()> {
 
     let multi_line = background > 0.0 || adjustment != 0.0;
     if multi_line {
-        let transcript_val = format!("{:>width$}", format!("${:.2}", spent),      width = VW);
+        let transcript_val = format!("{:>width$}", format!("${:.2}", spent), width = VW);
         println!("  {:<width$} {}", "Transcripts", transcript_val, width = LW);
-        if background > 0.0 {
-            let background_val = format!("{:>width$}", format!("${:.2}", background), width = VW);
-            println!("  {:<width$} {}  ({} calls)", "Background", background_val, bg_calls, width = LW);
+        match &bg_src {
+            BgSource::Otel(calls) => {
+                let background_val = format!("{:>width$}", format!("${:.2}", background), width = VW);
+                println!("  {:<width$} {}  ({} calls)", "Background", background_val, calls, width = LW);
+            }
+            BgSource::Estimate(factor) => {
+                let background_val = format!("{:>width$}", format!("${:.2}", background), width = VW);
+                let pct_label = format!("est. {:.0}%", factor * 100.0);
+                println!("  {:<width$} {}  ({})", "Bkg (est.)", background_val, pct_label, width = LW);
+            }
+            BgSource::None => {}
         }
         if adjustment != 0.0 {
             let sign = if adjustment >= 0.0 { "+" } else { "" };

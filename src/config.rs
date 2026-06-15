@@ -16,6 +16,11 @@ pub struct Config {
     pub otel_enabled: bool,
     #[serde(default = "default_otel_port")]
     pub otel_port: u16,
+    /// Fraction of transcript spend added as estimated background cost when no OTEL data is
+    /// available. Based on observed ~6% gap from title/compaction Haiku calls invisible to
+    /// session transcripts. Set to 0.0 to disable the estimate.
+    #[serde(default = "default_background_factor")]
+    pub background_factor: f64,
 }
 
 fn default_budget() -> f64 {
@@ -30,6 +35,9 @@ fn default_sync_interval_secs() -> u64 {
 fn default_otel_port() -> u16 {
     4318
 }
+fn default_background_factor() -> f64 {
+    0.06
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -40,6 +48,7 @@ impl Default for Config {
             sync_interval_secs: default_sync_interval_secs(),
             otel_enabled: false,
             otel_port: default_otel_port(),
+            background_factor: default_background_factor(),
         }
     }
 }
@@ -86,6 +95,11 @@ api_port = 8788
 # Enable with: trakr otel enable
 otel_enabled = false
 otel_port = 4318
+
+# Estimated background-call overhead added to transcript spend when OTEL data is unavailable.
+# Background calls (title generation, compaction) are ~6% of total spend based on observed data.
+# Shown as a separate "(est.)" line in `trakr spend`. Set to 0.0 to disable.
+background_factor = 0.06
 "#;
     std::fs::write(&path, content)?;
     Ok(())
@@ -164,6 +178,31 @@ mod tests {
             assert!(base.join("config.toml").exists());
             // Should be idempotent.
             write_default_config()?;
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn background_factor_defaults_to_six_percent() {
+        let tmp = TempDir::new().unwrap();
+        with_home(&tmp, || {
+            let cfg = load_config()?;
+            assert!((cfg.background_factor - 0.06).abs() < 1e-9);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn background_factor_zero_disables_estimate() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().join(".trakr");
+        fs::create_dir_all(&base).unwrap();
+        fs::write(base.join("config.toml"), "background_factor = 0.0\n").unwrap();
+        with_home(&tmp, || {
+            let cfg = load_config()?;
+            assert_eq!(cfg.background_factor, 0.0);
             Ok(())
         })
         .unwrap();
