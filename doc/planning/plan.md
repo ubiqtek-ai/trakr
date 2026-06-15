@@ -261,6 +261,12 @@ Design doc: `doc/planning/otel-gap-fill-plan.md`
 - TODO - README: "Optional: OTEL gap-fill" section
 - TODO - `trakr status`: warn if OTEL enabled but no batches received in >90 s
 
+### Action 5.7: Manual cost adjustment
+- TODO - `Event::CostAdjustment { amount_usd, reason, month }` — included in spend sum alongside TokenUsage + BackgroundApiCall
+- TODO - `trakr adjust --month YYYY-MM --amount N.NN --reason "..."` CLI command
+- NOTE - Use case: one-time correction for the pre-OTEL historical gap (background calls before OTEL was enabled are unrecoverable; this lets the user apply a known delta manually)
+- NOTE - Adjustment events stored in DB with full audit trail; `trakr spend` shows them as a separate line when non-zero
+
 ### Action 5.5: Anthropic Analytics API integration (optional "exact mode")
 - TODO - `GET /v1/organizations/analytics/cost_report` — returns pre-calculated spend in cents; no token multiplication needed
 - TODO - Auth: `x-api-key` with `read:analytics` scope (org admin key — not available to all users)

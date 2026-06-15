@@ -52,6 +52,17 @@ pub enum Event {
         cost_usd: f64,
         query_source: String,
     },
+    /// A manual spend adjustment applied to a specific day.
+    ///
+    /// `amount_usd` may be negative (to reduce the spend shown for a month) or positive (to add
+    /// costs that are otherwise invisible, e.g. pre-installation gap or a price-change correction).
+    /// Stored under session_id `"__adjustments__"` with `timestamp = <day>T00:00:00Z`.
+    CostAdjustment {
+        day: String,
+        amount_usd: f64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
     Other {
         hook_event_name: String,
         payload: serde_json::Value,
@@ -70,6 +81,7 @@ impl Event {
             Event::ContextCompression { .. } => "context_compression",
             Event::TokenUsage { .. } => "token_usage",
             Event::BackgroundApiCall { .. } => "background_api_call",
+            Event::CostAdjustment { .. } => "cost_adjustment",
             Event::Other { .. } => "other",
         }
     }

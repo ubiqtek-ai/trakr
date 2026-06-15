@@ -80,8 +80,9 @@ sync_interval_secs = 30
 api_enabled = false
 api_port = 8788
 
-# OTEL telemetry receiver. Enable via `trakr otel enable`.
-otel_enabled = false
+# OTEL telemetry receiver — captures background API calls (title/summary generation)
+# that are not visible in session transcripts, closing ~9% of the spend gap.
+otel_enabled = true
 otel_port = 4318
 "#;
     std::fs::write(&path, content)?;

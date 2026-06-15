@@ -286,6 +286,31 @@ pub fn insert_background_api_call(
     Ok(())
 }
 
+/// Sum `amount_usd` from all `cost_adjustment` events attributed to the given `YYYY-MM` month.
+///
+/// Attribution uses the event timestamp (set to `<day>T00:00:00Z` by `trakr adjust`).
+/// Returns 0.0 if no adjustments exist for the month.
+pub fn get_monthly_adjustment_usd(year_month: &str) -> Result<f64> {
+    let conn = open_db()?;
+    let mut stmt = conn.prepare(
+        "SELECT payload FROM events \
+         WHERE event_type = 'cost_adjustment' \
+         AND strftime('%Y-%m', timestamp) = ?1",
+    )?;
+    let payloads: Vec<String> = stmt
+        .query_map(params![year_month], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut total = 0.0f64;
+    for payload in payloads {
+        let Ok(event) = serde_json::from_str::<Event>(&payload) else { continue };
+        if let Event::CostAdjustment { amount_usd, .. } = event {
+            total += amount_usd;
+        }
+    }
+    Ok(total)
+}
+
 /// Sum `cost_usd` from all `background_api_call` events in the given `YYYY-MM` month.
 ///
 /// Returns 0.0 if OTEL is not enabled or no data has arrived yet.

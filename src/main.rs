@@ -141,6 +141,17 @@ enum Commands {
         #[command(subcommand)]
         action: OtelAction,
     },
+    /// Record a manual spend adjustment for a specific day (amount may be negative)
+    Adjust {
+        /// Date the adjustment applies to (YYYY-MM-DD) — determines month attribution
+        day: String,
+        /// Amount in USD; positive to add spend, negative to subtract
+        #[arg(allow_hyphen_values = true)]
+        amount: f64,
+        /// Optional free-text reason stored with the adjustment for audit purposes
+        #[arg(long, short = 'r')]
+        reason: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -191,6 +202,7 @@ fn run(cli: Cli) -> Result<()> {
             OtelAction::Enable  => cmd_otel_enable(),
             OtelAction::Disable => cmd_otel_disable(),
         },
+        Commands::Adjust { day, amount, reason } => cmd_adjust(&day, amount, reason),
     }
 }
 
@@ -248,12 +260,25 @@ fn cmd_init() -> Result<()> {
     storage::init_db()?;
     trakr::config::write_default_config()?;
 
+    // Enable OTEL by default: write env vars to ~/.claude/settings.json so telemetry
+    // is active from the first session.  Best-effort — a warning is printed if it fails.
+    let cfg = trakr::config::load_config().unwrap_or_default();
+    let otel_status = if cfg.otel_enabled {
+        match merge_otel_env_to_claude_settings(cfg.otel_port) {
+            Ok(()) => format!("enabled (port {})", cfg.otel_port),
+            Err(e) => format!("enabled in config but env-var write failed: {:#}", e),
+        }
+    } else {
+        "disabled".to_string()
+    };
+
     println!("trakr: initialised {}", base.display());
     println!("trakr: unified DB:         {}", base.join("trakr.db").display());
     println!("trakr: sessions directory: {}", sessions.display());
     println!("trakr: transcripts:        {}", transcripts.display());
     println!("trakr: archive:            {}", archive_dir.display());
     println!("trakr: config:             {}", base.join("config.toml").display());
+    println!("trakr: OTEL telemetry:     {}", otel_status);
     println!();
     println!("Run `trakr install-service` to start the background service.");
     println!("Run `trakr backfill-logs` to import existing Claude sessions.");
@@ -547,6 +572,13 @@ fn cmd_show(session_id: &str) -> Result<()> {
             }
             Event::BackgroundApiCall { model, cost_usd, query_source, .. } => {
                 format!("model={} cost=${:.4} source={}", model, cost_usd, query_source)
+            }
+            Event::CostAdjustment { day, amount_usd, reason } => {
+                let sign = if *amount_usd >= 0.0 { "+" } else { "" };
+                match reason {
+                    Some(r) => format!("day={} amount={}{:.2} reason={}", day, sign, amount_usd, r),
+                    None    => format!("day={} amount={}{:.2}", day, sign, amount_usd),
+                }
             }
             Event::Other { hook_event_name, .. } => {
                 format!("hook={}", hook_event_name)
@@ -1284,16 +1316,19 @@ fn cmd_spend(json: bool) -> Result<()> {
         0.0
     };
 
+    let adjustment = storage::get_monthly_adjustment_usd(&year_month).unwrap_or(0.0);
+
     if json {
         // Fast path: DB read only, no reconciliation. The serve daemon keeps the DB current.
         let (spent, count) = storage::get_monthly_spend_usd(&year_month)?;
-        let total = spent + background;
+        let total = spent + background + adjustment;
         let pct = if cfg.monthly_budget_usd > 0.0 { total / cfg.monthly_budget_usd * 100.0 } else { 0.0 };
         println!(
-            r#"{{"month":"{month}","spent_usd":{spent:.2},"background_usd":{background:.2},"total_usd":{total:.2},"budget_usd":{budget:.2},"pct":{pct:.1},"sessions":{count}}}"#,
+            r#"{{"month":"{month}","spent_usd":{spent:.2},"background_usd":{background:.2},"adjustment_usd":{adjustment:.2},"total_usd":{total:.2},"budget_usd":{budget:.2},"pct":{pct:.1},"sessions":{count}}}"#,
             month      = year_month,
             spent      = spent,
             background = background,
+            adjustment = adjustment,
             total      = total,
             budget     = cfg.monthly_budget_usd,
             pct        = pct,
@@ -1308,7 +1343,7 @@ fn cmd_spend(json: bool) -> Result<()> {
     }
 
     let (spent, count) = storage::get_monthly_spend_usd(&year_month)?;
-    let total = spent + background;
+    let total = spent + background + adjustment;
     let now_local = chrono::Local::now();
     let month_label = now_local.format("%B %Y").to_string();
     let pct = if cfg.monthly_budget_usd > 0.0 { total / cfg.monthly_budget_usd * 100.0 } else { 0.0 };
@@ -1334,13 +1369,21 @@ fn cmd_spend(json: bool) -> Result<()> {
     println!("Spend for {} ({} sessions)", month_label, count);
     println!("{}", "-".repeat(W));
 
-    if background > 0.0 {
+    let multi_line = background > 0.0 || adjustment != 0.0;
+    if multi_line {
         let transcript_val = format!("{:>width$}", format!("${:.2}", spent),      width = VW);
-        let background_val = format!("{:>width$}", format!("${:.2}", background), width = VW);
-        let total_val      = format!("{:>width$}", format!("${:.2}", total),      width = VW);
         println!("  {:<width$} {}", "Transcripts", transcript_val, width = LW);
-        println!("  {:<width$} {}", "Background",  background_val, width = LW);
-        println!("  {:<width$} {}", "Total",        total_val,      width = LW);
+        if background > 0.0 {
+            let background_val = format!("{:>width$}", format!("${:.2}", background), width = VW);
+            println!("  {:<width$} {}", "Background", background_val, width = LW);
+        }
+        if adjustment != 0.0 {
+            let sign = if adjustment >= 0.0 { "+" } else { "" };
+            let adj_val = format!("{:>width$}", format!("{}{:.2}", sign, adjustment), width = VW);
+            println!("  {:<width$} {}", "Adjustment", adj_val, width = LW);
+        }
+        let total_val = format!("{:>width$}", format!("${:.2}", total), width = VW);
+        println!("  {:<width$} {}", "Total", total_val, width = LW);
     } else {
         let cost_val = format!("{:>width$}", format!("${:.2}", spent), width = VW);
         println!("  {:<width$} {}", "Cost", cost_val, width = LW);
@@ -1858,6 +1901,35 @@ fn cmd_logs(lines: usize) -> Result<()> {
         anyhow::bail!("tail exited with status {}", status);
     }
 
+    Ok(())
+}
+
+// ── Manual spend adjustment ───────────────────────────────────────────────────
+
+fn cmd_adjust(day: &str, amount: f64, reason: Option<String>) -> Result<()> {
+    use trakr::event::Event;
+
+    chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d")
+        .with_context(|| format!("'{}' is not a valid date — expected YYYY-MM-DD", day))?;
+
+    let event = Event::CostAdjustment {
+        day: day.to_string(),
+        amount_usd: amount,
+        reason: reason.clone(),
+    };
+
+    let timestamp: chrono::DateTime<Utc> = format!("{}T00:00:00Z", day)
+        .parse()
+        .with_context(|| format!("converting '{}' to timestamp", day))?;
+
+    storage::init_db()?;
+    storage::insert_event("__adjustments__", &event, timestamp)?;
+
+    let sign = if amount >= 0.0 { "+" } else { "" };
+    println!("Adjustment recorded: {}{:.2} for {}", sign, amount, day);
+    if let Some(r) = reason {
+        println!("Reason: {}", r);
+    }
     Ok(())
 }
 
