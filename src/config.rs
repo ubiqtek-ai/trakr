@@ -82,7 +82,9 @@ api_port = 8788
 
 # OTEL telemetry receiver — captures background API calls (title/summary generation)
 # that are not visible in session transcripts, closing ~9% of the spend gap.
-otel_enabled = true
+# Note: does not work on enterprise Claude Code accounts.
+# Enable with: trakr otel enable
+otel_enabled = false
 otel_port = 4318
 "#;
     std::fs::write(&path, content)?;

@@ -260,26 +260,12 @@ fn cmd_init() -> Result<()> {
     storage::init_db()?;
     trakr::config::write_default_config()?;
 
-    // Always enable OTEL on init — upgrades pre-existing configs that predate the default.
-    let mut cfg = trakr::config::load_config().unwrap_or_default();
-    if !cfg.otel_enabled {
-        cfg.otel_enabled = true;
-        if let Err(e) = trakr::config::save_config(&cfg) {
-            eprintln!("trakr: warning: could not update config: {:#}", e);
-        }
-    }
-    let otel_status = match merge_otel_env_to_claude_settings(cfg.otel_port) {
-        Ok(()) => format!("enabled (port {})", cfg.otel_port),
-        Err(e) => format!("enabled in config but env-var write failed: {:#}", e),
-    };
-
     println!("trakr: initialised {}", base.display());
     println!("trakr: unified DB:         {}", base.join("trakr.db").display());
     println!("trakr: sessions directory: {}", sessions.display());
     println!("trakr: transcripts:        {}", transcripts.display());
     println!("trakr: archive:            {}", archive_dir.display());
     println!("trakr: config:             {}", base.join("config.toml").display());
-    println!("trakr: OTEL telemetry:     {}", otel_status);
     println!();
     println!("Run `trakr install-service` to start the background service.");
     println!("Run `trakr restart-service` if the service is already running.");
