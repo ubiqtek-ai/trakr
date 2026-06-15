@@ -1,7 +1,7 @@
 # Implementation Plan
 
 ## ── WHAT'S NEXT ──────────────────────────────────────────────────────────
-**Next:** Action 5.6 Phase D — UX polish: README "Optional: OTEL gap-fill" section; `trakr status` warn if OTEL enabled but no batches in >90 s
+**Next:** Action 5.6 Phase D — `trakr status` warn if OTEL enabled but no batches received in >90 s
 **Sub-doc:** `doc/planning/otel-gap-fill-plan.md`
 **Blockers:** None
 ─────────────────────────────────────────────────────────────────────────────
@@ -258,14 +258,16 @@ Design doc: `doc/planning/otel-gap-fill-plan.md`
 - ✓ DONE - `trakr v0.1.5` published to crates.io; 73 tests passing
 
 #### Phase D — UX polish
-- TODO - README: "Optional: OTEL gap-fill" section
+- ✓ DONE - README: "Optional: OTEL gap-fill" section rewritten; "Manual spend adjustments" section added; commands table updated; `trakr init` quick-start updated
 - TODO - `trakr status`: warn if OTEL enabled but no batches received in >90 s
 
 ### Action 5.7: Manual cost adjustment
-- TODO - `Event::CostAdjustment { amount_usd, reason, month }` — included in spend sum alongside TokenUsage + BackgroundApiCall
-- TODO - `trakr adjust --month YYYY-MM --amount N.NN --reason "..."` CLI command
-- NOTE - Use case: one-time correction for the pre-OTEL historical gap (background calls before OTEL was enabled are unrecoverable; this lets the user apply a known delta manually)
-- NOTE - Adjustment events stored in DB with full audit trail; `trakr spend` shows them as a separate line when non-zero
+- ✓ DONE - `Event::CostAdjustment { day, amount_usd, reason }` added to `src/event.rs` — uses YYYY-MM-DD `day` field (more precise than `month`) for month attribution; `reason` is `Option<String>`
+- ✓ DONE - `storage::get_monthly_adjustment_usd(year_month)` — sums `cost_adjustment` events by timestamp month
+- ✓ DONE - `trakr adjust <day> <amount> [--reason "..."]` CLI command — positional `day` + `amount` (negative allowed via `allow_hyphen_values`); stored under session `"__adjustments__"` with `timestamp = <day>T00:00:00Z`
+- ✓ DONE - `trakr spend` shows Adjustment line (with `+`/`-` sign) when non-zero; contributes to Total; `--json` gains `adjustment_usd` field
+- ✓ DONE - `trakr init` enables OTEL by default: `write_default_config()` writes `otel_enabled = true`; `cmd_init` calls `merge_otel_env_to_claude_settings()` automatically
+- ✓ DONE - v0.1.6 version bumped in `Cargo.toml`
 
 ### Action 5.5: Anthropic Analytics API integration (optional "exact mode")
 - TODO - `GET /v1/organizations/analytics/cost_report` — returns pre-calculated spend in cents; no token multiplication needed
@@ -278,32 +280,6 @@ Design doc: `doc/planning/otel-gap-fill-plan.md`
 
 ---
 
-
-## ── CHECKPOINT: Session 2026-06-14 (single-ledger complete + UX polish) ────
-
-**What was completed this session:**
-- `trakr repair --run` executed: 60 sessions rebuilt from corrected parser, spend corrected
-- Bug fixes landed: `aiTitle` field name (titles now populate), `parse_timestamp` Utc::now() fallback (was stomping `last_activity_at` for all backfilled sessions → fake 34 "active" sessions), `trakr repair` defaults to `--run` (no flag required)
-- `trakr spend` redesigned: local time with UTC offset, session count in title line, clean 3-row table (Cost / Budget / Used), no OTEL noise
-- `trakr inspect-logs` redesigned: single-ledger aware (Stale / New / Orphaned counts), all-time + monthly spend, `--verbose` per-session table with title + spend + sync status; hooks-era Complete/Partial/Missing terminology removed
-- `trakr sync` new command: manually triggers reconciliation sweep, prints stats + timestamp
-- `TrackingStatus`, `SessionSummary`, `inspect_logs` (hooks-era dead code) deleted from `backfill.rs`
-- New storage functions: `get_all_sessions_meta`, `get_spend_by_session`, `get_total_spend_usd`
-- 66 tests passing; `cargo build` warning-free
-
-**State of the project:**
-- `trakr spend` shows $112.95 / $200.00 (56.5%) for June 2026 — accurate single-source figure
-- `trakr inspect-logs` shows 60/60 sessions in DB, 0 stale, titles populated; all-time spend $225.65
-- `trakr serve` running as launchd service (30 s reconciliation loop, daily archive sweep)
-- Single-ledger architecture fully live; OTEL receiver parked but compiles
-
-**Immediate next priorities:**
-1. Action 4d.3 — `trakr list` with title + project; `trakr show` with title + summary
-2. Filtering/JSON output on `list`, `show`, `stats`
-3. README update to document `sync`, `inspect-logs` redesign, `repair` default behaviour
-4. CI/CD and crates.io publication (Action 5.3)
-
-─────────────────────────────────────────────────────────────────────────────
 
 ## ── CHECKPOINT: Session 2026-06-14 (daemon polish + status line integration) ──
 
@@ -527,6 +503,30 @@ Design doc: `doc/planning/otel-gap-fill-plan.md`
 3. Action 4d.3 — `trakr list` with title + project; `trakr show` with title + summary
 4. Action 5.4 — CodeQL setup (reference: `~/projects/tsk`)
 5. GitHub Actions CI/CD (Action 5.3)
+
+─────────────────────────────────────────────────────────────────────────────
+
+## ── CHECKPOINT: Session 2026-06-15 (OTEL by default + manual adjustments) ──
+
+**What was completed this session:**
+- `trakr init` now enables OTEL by default: `write_default_config()` writes `otel_enabled = true`; `cmd_init` calls `merge_otel_env_to_claude_settings()` so env vars land in `~/.claude/settings.json` automatically
+- `Event::CostAdjustment { day, amount_usd, reason }` added to `src/event.rs`; `event_type_label()` returns `"cost_adjustment"`
+- `storage::get_monthly_adjustment_usd()` sums adjustment events for a given month
+- `trakr adjust <day> <amount> [--reason "..."]` subcommand: stored under `"__adjustments__"` session with `timestamp = <day>T00:00:00Z`; negative amounts work via `allow_hyphen_values`
+- `trakr spend` shows "Adjustment" line with `+`/`-` sign when non-zero; total = transcripts + background + adjustment; `--json` gains `adjustment_usd` field
+- README: features list, quick-start, commands table (added `adjust`, `sync`, `sync-rates`, `restart-service`, `otel enable/disable`; fixed `inspect-logs` → `inspect`), new "Manual spend adjustments" section, "Optional: OTEL gap-fill" section rewritten
+- `Cargo.toml` bumped to `0.1.6`; 73 tests passing; Phase D README item marked done
+
+**State of the project:**
+- `trakr v0.1.6` ready to publish; `cargo build` clean; 73 tests passing
+- OTEL on by default for all fresh installs; existing installs unaffected until they re-run `trakr init`
+- Manual adjustments fully functional: `trakr adjust 2026-05-01 -48.00 --reason "pre-install gap"` works
+
+**Immediate next priorities:**
+1. Phase D remaining — `trakr status`: warn if OTEL enabled but no batches received in >90 s
+2. Action 4d.3 — `trakr list` with title + project; `trakr show` with title + summary
+3. Action 5.4 — CodeQL setup (reference: `~/projects/tsk`)
+4. GitHub Actions CI/CD (Action 5.3)
 
 ─────────────────────────────────────────────────────────────────────────────
 

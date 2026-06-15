@@ -260,16 +260,17 @@ fn cmd_init() -> Result<()> {
     storage::init_db()?;
     trakr::config::write_default_config()?;
 
-    // Enable OTEL by default: write env vars to ~/.claude/settings.json so telemetry
-    // is active from the first session.  Best-effort — a warning is printed if it fails.
-    let cfg = trakr::config::load_config().unwrap_or_default();
-    let otel_status = if cfg.otel_enabled {
-        match merge_otel_env_to_claude_settings(cfg.otel_port) {
-            Ok(()) => format!("enabled (port {})", cfg.otel_port),
-            Err(e) => format!("enabled in config but env-var write failed: {:#}", e),
+    // Always enable OTEL on init — upgrades pre-existing configs that predate the default.
+    let mut cfg = trakr::config::load_config().unwrap_or_default();
+    if !cfg.otel_enabled {
+        cfg.otel_enabled = true;
+        if let Err(e) = trakr::config::save_config(&cfg) {
+            eprintln!("trakr: warning: could not update config: {:#}", e);
         }
-    } else {
-        "disabled".to_string()
+    }
+    let otel_status = match merge_otel_env_to_claude_settings(cfg.otel_port) {
+        Ok(()) => format!("enabled (port {})", cfg.otel_port),
+        Err(e) => format!("enabled in config but env-var write failed: {:#}", e),
     };
 
     println!("trakr: initialised {}", base.display());
@@ -281,6 +282,7 @@ fn cmd_init() -> Result<()> {
     println!("trakr: OTEL telemetry:     {}", otel_status);
     println!();
     println!("Run `trakr install-service` to start the background service.");
+    println!("Run `trakr restart-service` if the service is already running.");
     println!("Run `trakr backfill-logs` to import existing Claude sessions.");
 
     Ok(())
