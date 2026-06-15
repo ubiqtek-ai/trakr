@@ -54,6 +54,9 @@ enum Commands {
     Stats {
         #[arg(long, short = 'v')]
         verbose: bool,
+        /// Filter to a specific month (YYYY-MM)
+        #[arg(long, short = 'm')]
+        month: Option<String>,
     },
     /// Delete all recorded data (DB and JSONL files)
     Reset {
@@ -151,7 +154,7 @@ fn run(cli: Cli) -> Result<()> {
         Commands::List => cmd_list(),
         Commands::Migrate => cmd_migrate(),
         Commands::Show { session_id } => cmd_show(&session_id),
-        Commands::Stats { verbose } => cmd_stats(verbose),
+        Commands::Stats { verbose, month } => cmd_stats(verbose, month.as_deref()),
         Commands::Reset { yes } => cmd_reset(yes),
         Commands::Serve { api_port, otel_port } => cmd_serve(api_port, otel_port),
         Commands::Spend { json } => cmd_spend(json),
@@ -543,14 +546,25 @@ fn cmd_show(session_id: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_stats(verbose: bool) -> Result<()> {
+fn cmd_stats(verbose: bool, month: Option<&str>) -> Result<()> {
     use trakr::event::Event;
     use std::collections::HashMap;
 
     let all_events = storage::get_events(None)?;
-    let sessions = storage::get_sessions()?;
 
-    let total_sessions = sessions.len();
+    // Apply month filter (YYYY-MM) on the event timestamp.
+    let all_events: Vec<_> = if let Some(ym) = month {
+        all_events.into_iter().filter(|(_, ts, _)| {
+            ts.format("%Y-%m").to_string() == ym
+        }).collect()
+    } else {
+        all_events
+    };
+
+    // Count distinct sessions in the filtered event set.
+    let session_ids: std::collections::HashSet<&str> =
+        all_events.iter().map(|(sid, _, _)| sid.as_str()).collect();
+    let total_sessions = session_ids.len();
     let total_events = all_events.len();
 
     // Per-model token accumulators: model → (input, output, cache_create, cache_read, events)
@@ -578,6 +592,7 @@ fn cmd_stats(verbose: bool) -> Result<()> {
                 cache_creation_input_tokens: cc,
                 cache_read_input_tokens: cr,
                 total_tokens: tot,
+                ..
             } => {
                 let e = model_tokens.entry(model.clone()).or_insert((0, 0, 0, 0, 0));
                 e.0 += inp;
@@ -598,6 +613,9 @@ fn cmd_stats(verbose: bool) -> Result<()> {
 
     println!("trakr stats");
     println!("{}", "=".repeat(39));
+    if let Some(ym) = month {
+        println!("Month: {}", ym);
+    }
     println!();
     println!("Sessions: {}   Events: {}", total_sessions, total_events);
 
@@ -644,18 +662,23 @@ fn cmd_stats(verbose: bool) -> Result<()> {
     }
 
     // Session list — verbose only.
-    if verbose && !sessions.is_empty() {
+    if verbose && !session_first.is_empty() {
+        // Build event count per session from the filtered event set.
+        let mut session_event_count: HashMap<String, usize> = HashMap::new();
+        for (sid, _, _) in &all_events {
+            *session_event_count.entry(sid.clone()).or_insert(0) += 1;
+        }
+        let mut session_list: Vec<_> = session_first.iter().collect();
+        session_list.sort_by_key(|(_, ts)| *ts);
         println!();
         println!("Sessions:");
-        for (sid, count) in &sessions {
-            let date = session_first
-                .get(sid)
-                .map(|dt| dt.format("%Y-%m-%d").to_string())
-                .unwrap_or_else(|| "unknown   ".to_string());
+        for (sid, ts) in &session_list {
+            let date = ts.format("%Y-%m-%d").to_string();
+            let count = session_event_count.get(*sid).copied().unwrap_or(0);
             let short_id = if sid.len() > 12 {
                 format!("{}...", &sid[..9])
             } else {
-                sid.clone()
+                sid.to_string()
             };
             println!("  {:<14}  {}  {} events", short_id, date, count);
         }

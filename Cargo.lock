@@ -1321,7 +1321,7 @@ dependencies = [
 
 [[package]]
 name = "trakr"
-version = "0.1.2"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "axum",

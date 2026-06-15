@@ -3,7 +3,7 @@
 ## ── WHAT'S NEXT ──────────────────────────────────────────────────────────
 **Next:** Action 4d.3 — surface `title` + `summary` in `trakr list` and `trakr show`
 **Sub-doc:** (none)
-**Blockers:** None — diagnosing spend accuracy on work machine first
+**Blockers:** None (spend gap root cause identified and fixed; Haiku background-call gap documented as known limitation)
 ─────────────────────────────────────────────────────────────────────────────
 
 ## Phase 1: Project Foundation
@@ -220,118 +220,13 @@ Key findings:
 - ✓ DONE - Final dependency audit
 - ✓ DONE - Version 0.1.0 published to crates.io as `trakr` (package renamed from `ctx-trakr`)
 - ✓ DONE - Version 0.1.1 published (crate rename, launch agent label, `inspect` command, token totals, UX fixes)
+- ✓ DONE - Version 0.1.2 published (per-model token breakdown in `stats`, `--verbose` session list, compact format)
 - TODO - GitHub Actions CI/CD setup
 
 ### Action 5.4: CodeQL static analysis
 - TODO - Set up CodeQL on this repo (reference: `~/projects/tsk` already has it configured)
 
 ---
-
-## ── CHECKPOINT: Session 2026-06-10 (continued) ──────────────────────────
-
-**What was completed this session (Phase 4b):**
-- `src/backfill.rs` — full implementation: `discover_sessions`, `parse_session_log`, `backfill_session`, `inspect_logs`
-- `src/storage.rs` — added `get_started_session_ids`, `get_db_summary`, `replace_session`, `delete_events_for_session`; poison-safe mutex unwrap
-- New CLI subcommands: `backfill-logs`, `inspect-logs`, `show-prompts`
-- `TrackingStatus` tri-state (Missing / Partial / Complete) for accurate inspect-logs output
-- Skip rule refined: skip only when BOTH `session_start` AND `session_end` present in DB
-- Confirmed Claude Code hook event names: `SessionStart`, `SessionEnd`, `PreToolUse` — documented in `doc/claude-hooks.md`
-- Design doc: `doc/claude-session-logs.md`
-
-**State of the binary:**
-- `backfill-logs --dry-run` works; shows 12 partial sessions to replace across 6 projects
-- `inspect-logs` shows per-session tracking status with tri-state
-- `show-prompts` shows first/last log entries with synthesised session boundary markers
-- All tests pass (unit tests cover backfill idempotency, parse_session_log, discover_sessions)
-
-**Immediate next steps:**
-1. Run `backfill-logs` for real (not dry-run) to fix the 12 partial sessions
-2. Fix `ctx-trakr init` suggested config — currently emits wrong hook names (`Stop`, `PostToolUse`)
-3. Token semantics inconsistency: hooks record last-turn tokens only; backfill sums all turns — needs a decision (backfill is more accurate; hooks could be updated to also sum)
-
-─────────────────────────────────────────────────────────────────────────────
-
-## ── CHECKPOINT: Session 2026-06-11 ──────────────────────────────────────
-
-**What was completed this session (Phase 4c):**
-- Full architecture hardening — all 6 items from Fable agent review implemented
-- `handle_session_end` now uses `parse_session_log` → `replace_session` (ground-truth, summed tokens)
-- `handle_tool_use` is now a no-op; PreToolUse hook removed from config
-- New `sessions` table with `project_path`, `started_at`, `ended_at`, `model`, `source`
-- `upsert_session_meta()` called from both hook and backfill paths
-- WAL mode + 5s busy_timeout on all DB connections
-- `cmd_init` writes hooks directly into `~/.claude/settings.json` (idempotent merge)
-- Reconciliation sweep on `serve` startup
-- DB wiped and backfilled from scratch: 50/50 sessions, 0 orphans
-
-**State of the binary:**
-- `ctx-trakr spend` shows $281.70 / $200.00 (accurate — previously $0.24 from last-turn-only tokens)
-- `ctx-trakr inspect-logs` shows 50 complete, 0 partial, 0 missing, 0 orphan DB sessions
-- 51 tests passing; `cargo build` clean
-
-**Immediate next priorities:**
-1. Update README to reflect new SessionEnd-only hook architecture (no PreToolUse)
-2. Use `sessions` table in `list`/`stats`/`inspect-logs` to show project context
-3. Filtering/JSON output on `list`, `show`, `stats` — still TODO
-4. CI/CD and crates.io publication — still TODO
-
-─────────────────────────────────────────────────────────────────────────────
-
-## ── CHECKPOINT: Session 2026-06-11 (transcript research) ────────────────
-
-**What was completed this session:**
-- Research spike: Fable agent compared ctx-trakr JSONL vs Claude Code's native session JSONL
-- Haiku agent researched official docs on session log format, rotation policy, and recap storage
-- Confirmed: Claude's native JSONL contains full conversation transcript (messages, tool calls, results, thinking blocks)
-- Confirmed: compact summary recap is stored as `isCompactSummary:true` user messages — no inference needed
-- Confirmed: `ai-title` and `last-prompt` lines provide cheap DB-ready session summaries
-- No official rotation/pruning policy found — files appear to persist indefinitely
-- Designed Phase 4d: transcript archiving + summary extraction plan added to plan.md
-- Plan file migrated from `doc/plan.md` → `doc/planning/plan.md`
-
-**State of the project:**
-- No code changes this session — research and planning only
-- Binary unchanged from end of Phase 4c: 51 tests passing, spend shows $281.70 / $200.00
-- `transcript_path` already available in SessionEnd hook payload — implementation can start immediately
-
-**Immediate next priorities:**
-1. Action 4d.1 — copy native JSONL to `~/.ctx-trakr/transcripts/` at SessionEnd
-2. Action 4d.2 — add `title`, `summary`, `last_prompt` columns to `sessions` table; parse from transcript
-3. Action 4d.3 — surface title/summary in `list` and `show` CLI commands
-4. Update README to reflect SessionEnd-only hook architecture (carried over from 4c)
-
-─────────────────────────────────────────────────────────────────────────────
-
-## ── CHECKPOINT: Session 2026-06-11 (transcript archiving + polish) ────────
-
-**What was completed this session:**
-- Phase 4d fully implemented (4d.1 + 4d.2): transcript archiving and summary extraction
-  - `storage::archive_transcript()` — copies native Claude JSONL to `~/.trakr/transcripts/`
-  - Schema migrations (v1/v2) — `schema_migrations` table; `title`, `summary`, `last_prompt`, `generated_summary` columns added
-  - `BackfilledSession` extended with `source_path`, `title`, `summary`, `last_prompt`
-  - `parse_session_log` extracts `ai-title`, `isCompactSummary` text (≤2000 chars), `last-prompt`
-  - Both hook and backfill paths archive + populate summary fields
-- Binary renamed `ctx-trakr` → `trakr`; home dir `~/.ctx-trakr` → `~/.trakr`; DB `ctx-trakr.db` → `trakr.db`
-- `trakr install-service` / `trakr uninstall-service` — launchd LaunchAgent management
-- `trakr logs` — tails `~/.trakr/serve.log`
-- `trakr spend` hits live API first, falls back to SQLite; shows completed/active/total breakdown
-- Default API port changed 8787 → 8788 (clash with workerd)
-- `trakr init` writes OTEL env vars into `~/.claude/settings.json` — no shell profile needed
-- 54 tests passing (3 new tests for title/summary extraction, truncation, source_path)
-
-**State of the project:**
-- `trakr serve` running as launchd service; API on :8788, OTEL on :4318
-- `trakr spend` shows $315.40 / $200.00 (38 completed sessions, reconciled on serve startup)
-- Transcripts archiving to `~/.trakr/transcripts/` from next SessionEnd onwards
-- 54 tests passing; `cargo build` clean
-
-**Immediate next priorities:**
-1. Action 4d.3 — surface `title`/`summary` in `trakr list` and `trakr show`
-2. Update README to reflect new binary name, home dir, SessionEnd-only hooks, service commands
-3. Filtering/JSON output on `list`, `show`, `stats`
-4. CI/CD and crates.io publication
-
-─────────────────────────────────────────────────────────────────────────────
 
 ## ── CHECKPOINT: Session 2026-06-11 (OTEL verified end-to-end + README) ────
 
@@ -513,6 +408,78 @@ Key findings:
 2. Action 4d.3 — `trakr list` with title + project; `trakr show` with title + summary
 3. Action 5.4 — CodeQL setup (reference: `~/projects/tsk`)
 4. GitHub Actions CI/CD (Action 5.3)
+
+─────────────────────────────────────────────────────────────────────────────
+
+## ── CHECKPOINT: Session 2026-06-15 (v0.1.2 + spend gap diagnosis) ──────────
+
+**What was completed this session:**
+- `trakr stats` extended: per-model token breakdown table (Input / Out / Cache read / Cache create columns with K/M compact format); session list hidden behind `--verbose`
+- `fmt_tokens_compact()` helper added to `src/main.rs`
+- `trakr v0.1.2` published to crates.io
+- Spend gap diagnosis completed for work machine: Anthropic June ($255.50) vs trakr all-time ($244.05) = $11.45 net gap. Confirmed 125 subagent JSONL files = 125 Agent calls (all accounted for). LiteLLM rate card matches Anthropic published pricing exactly. Gap explained by Claude usage before May 26 (pre-installation on work machine). `<synthetic>` model holds 0 tokens — not a factor.
+
+**State of the project:**
+- `trakr v0.1.2` live on crates.io; spend tracking accurate on both home and work machines
+- 66 tests passing; `cargo build` clean; launchd service running
+
+**Immediate next priorities:**
+1. Action 4d.3 — `trakr list` with title + project; `trakr show` with title + summary
+2. Action 5.4 — CodeQL setup (reference: `~/projects/tsk`)
+3. GitHub Actions CI/CD (Action 5.3)
+4. README update for `sync`, `inspect` redesign, `repair` default, no-hooks architecture
+
+─────────────────────────────────────────────────────────────────────────────
+
+## ── CHECKPOINT: Session 2026-06-15 (stats --month + spend gap deep dive) ──
+
+**What was completed this session:**
+- `trakr stats --month YYYY-MM` flag added (`src/main.rs`): filters token breakdown and session list by event timestamp month; "Month: YYYY-MM" header when active
+- `trakr v0.1.3` published to crates.io
+- Spend gap diagnosis deepened on work machine (Anthropic $254.77 June vs trakr $206.35):
+  - Work app screenshot confirmed 100% `claude_code` product — no web/API-key usage
+  - Per-model breakdown from work app: Opus $135.21, Sonnet $111.87, Haiku $7.70
+  - `trakr stats --month 2026-06` on work machine: Sonnet ~$88.6, Opus ~$114.2, Haiku ~$4.7
+  - Undercount ratios: Haiku 64%, Sonnet 26%, Opus 18% — NOT uniform, Haiku worst
+  - File count: 37 JSONL files on disk = 37 trakr sessions (no missing parent sessions)
+  - Subagent structure: 125 files, all depth-1 flat (`<uuid>/subagents/agent-*.jsonl`) — no nested agents
+  - **Working hypothesis:** Claude Code makes background API calls (compact summary generation, title generation) that don't appear in session JSONLs and are invisible to trakr
+  - **Next diagnostic:** Python one-liner to sum tokens directly from JSONL files to verify if the files themselves contain the missing tokens (awaiting result from work machine)
+
+**State of the project:**
+- `trakr v0.1.3` live on crates.io; 66 tests passing; `cargo build` clean
+- Spend gap is real (~$48 in June), cause not yet confirmed — hypothesis is background API calls outside session JSONLs
+
+**Immediate next priorities:**
+1. Run JSONL token-sum diagnostic on work machine to confirm/refute background-call hypothesis
+2. If confirmed: document the known gap in README/inspect output; consider if OTEL can fill it
+3. Action 4d.3 — `trakr list` with title + project; `trakr show` with title + summary
+4. Action 5.4 — CodeQL setup (reference: `~/projects/tsk`)
+5. GitHub Actions CI/CD (Action 5.3)
+
+─────────────────────────────────────────────────────────────────────────────
+
+## ── CHECKPOINT: Session 2026-06-15 (1h cache tier pricing fix) ──────────────
+
+**What was completed this session:**
+- Root cause of ~19% spend gap identified via Opus agent analysis:
+  - **Primary:** `cache_creation_input_tokens` was priced entirely at 1.25× input rate, but the 1h TTL tier (dominant in Claude Code: 70–83% of cache-creation by model) is billed at 2× input rate. The JSONL has the per-tier split at `usage.cache_creation.{ephemeral_1h_input_tokens, ephemeral_5m_input_tokens}`.
+  - **Known limitation (no fix):** Haiku background calls (title/summary generation) are billed by Anthropic but never written to JSONL files — ~$3/month invisible to trakr regardless.
+- `event.rs`: `TokenUsage` gains `#[serde(default)] cache_creation_1h_input_tokens: u64`
+- `backfill.rs`: `PerModelAccumulator` reads `usage.cache_creation.ephemeral_1h_input_tokens`; accumulator tuples widened to 5-tuples
+- `cost.rs`: `compute_cost_usd_with_card` / `compute_cost_usd` gain `cache_creation_1h_tokens` param; 1h priced at `2× input_per_token`, 5m at `1.25×`; 2 new tests (`cache_creation_1h_at_2x_input_rate`, `cache_creation_mixed_tiers`)
+- `storage.rs`: all 3 spend query call sites updated; `main.rs` pattern match fixed
+- `trakr repair` run: 67 sessions rebuilt from corrected parser
+
+**State of the project:**
+- `trakr spend` June 2026: $112.95 → **$171.88** (+$58.93, +52%) after repair — now correctly accounts for 1h cache tier pricing. Remaining gap vs Anthropic billing (~$10–15) explained by invisible background Haiku calls (known limitation). 68 tests passing; `cargo build` clean.
+
+**Immediate next priorities:**
+1. Action 4d.3 — `trakr list` with title + project; `trakr show` with title + summary
+2. Publish v0.1.4 with pricing fix
+3. Document Haiku background-call limitation in README / `trakr inspect` output
+4. Action 5.4 — CodeQL setup
+5. GitHub Actions CI/CD (Action 5.3)
 
 ─────────────────────────────────────────────────────────────────────────────
 

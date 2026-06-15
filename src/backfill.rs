@@ -155,8 +155,8 @@ fn truncate_chars(s: String, max_chars: usize) -> String {
 /// occurrence wins; duplicates are silently dropped. Entries with no `message.id`
 /// (rare; ~12 corpus-wide) are always counted — there is no key to dedupe on.
 struct PerModelAccumulator {
-    /// Total tokens per model name: (input, output, cache_creation, cache_read).
-    by_model: std::collections::HashMap<String, (u64, u64, u64, u64)>,
+    /// Total tokens per model name: (input, output, cache_creation, cache_read, cache_creation_1h).
+    by_model: std::collections::HashMap<String, (u64, u64, u64, u64, u64)>,
     /// Set of `message.id` values already counted — prevents double-counting multi-block
     /// API responses.
     seen_message_ids: std::collections::HashSet<String>,
@@ -201,12 +201,20 @@ impl PerModelAccumulator {
                 .get("cache_read_input_tokens")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
+            // 1-hour TTL cache writes cost 2× input rate (vs 1.25× for 5-min).
+            // The nested `cache_creation` object carries the per-tier split.
+            let cache_creation_1h = usage
+                .get("cache_creation")
+                .and_then(|cc| cc.get("ephemeral_1h_input_tokens"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
 
-            let entry = self.by_model.entry(model).or_insert((0, 0, 0, 0));
+            let entry = self.by_model.entry(model).or_insert((0, 0, 0, 0, 0));
             entry.0 += input;
             entry.1 += output;
             entry.2 += cache_creation;
             entry.3 += cache_read;
+            entry.4 += cache_creation_1h;
         }
 
         true
@@ -220,7 +228,7 @@ impl PerModelAccumulator {
         let mut dominant_model: Option<String> = None;
         let mut max_output: u64 = 0;
 
-        for (model, (input, output, cache_creation, cache_read)) in &self.by_model {
+        for (model, (input, output, cache_creation, cache_read, cache_creation_1h)) in &self.by_model {
             let total = input + output + cache_creation + cache_read;
             usage_events.push((
                 last_ts,
@@ -230,6 +238,7 @@ impl PerModelAccumulator {
                     output_tokens: *output,
                     cache_creation_input_tokens: *cache_creation,
                     cache_read_input_tokens: *cache_read,
+                    cache_creation_1h_input_tokens: *cache_creation_1h,
                     total_tokens: total,
                 },
             ));
@@ -820,10 +829,12 @@ mod tests {
         //   total = $8.00
         let total_cost: f64 = usage_events.iter().filter_map(|e| {
             if let Event::TokenUsage { model, input_tokens, output_tokens,
-                cache_creation_input_tokens, cache_read_input_tokens, .. } = e {
+                cache_creation_input_tokens, cache_read_input_tokens,
+                cache_creation_1h_input_tokens, .. } = e {
                 Some(crate::cost::compute_cost_usd(
                     model, *input_tokens, *output_tokens,
                     *cache_creation_input_tokens, *cache_read_input_tokens,
+                    *cache_creation_1h_input_tokens,
                 ))
             } else {
                 None
@@ -903,6 +914,7 @@ mod tests {
                     output_tokens: 5,
                     cache_creation_input_tokens: 0,
                     cache_read_input_tokens: 0,
+                    cache_creation_1h_input_tokens: 0,
                     total_tokens: 15,
                 }),
             ],

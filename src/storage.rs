@@ -369,6 +369,7 @@ pub fn get_monthly_spend_usd(year_month: &str) -> Result<(f64, usize)> {
                 output_tokens,
                 cache_creation_input_tokens,
                 cache_read_input_tokens,
+                cache_creation_1h_input_tokens,
                 ..
             } = event
             {
@@ -378,6 +379,7 @@ pub fn get_monthly_spend_usd(year_month: &str) -> Result<(f64, usize)> {
                     output_tokens,
                     cache_creation_input_tokens,
                     cache_read_input_tokens,
+                    cache_creation_1h_input_tokens,
                     &card,
                 );
             }
@@ -740,6 +742,7 @@ pub fn get_spend_by_session() -> Result<std::collections::HashMap<String, f64>> 
             output_tokens,
             cache_creation_input_tokens,
             cache_read_input_tokens,
+            cache_creation_1h_input_tokens,
             ..
         } = event
         {
@@ -749,6 +752,7 @@ pub fn get_spend_by_session() -> Result<std::collections::HashMap<String, f64>> 
                 output_tokens,
                 cache_creation_input_tokens,
                 cache_read_input_tokens,
+                cache_creation_1h_input_tokens,
                 &card,
             );
         }
@@ -783,6 +787,7 @@ pub fn get_total_spend_usd() -> Result<f64> {
             output_tokens,
             cache_creation_input_tokens,
             cache_read_input_tokens,
+            cache_creation_1h_input_tokens,
             ..
         } = event
         {
@@ -792,6 +797,7 @@ pub fn get_total_spend_usd() -> Result<f64> {
                 output_tokens,
                 cache_creation_input_tokens,
                 cache_read_input_tokens,
+                cache_creation_1h_input_tokens,
                 &card,
             );
         }
@@ -1050,6 +1056,7 @@ mod tests {
                     output_tokens: 0,
                     cache_creation_input_tokens: 0,
                     cache_read_input_tokens: 0,
+                    cache_creation_1h_input_tokens: 0,
                     total_tokens: 1_000_000,
                 },
                 ts,

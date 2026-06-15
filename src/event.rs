@@ -32,6 +32,10 @@ pub enum Event {
         output_tokens: u64,
         cache_creation_input_tokens: u64,
         cache_read_input_tokens: u64,
+        /// Subset of `cache_creation_input_tokens` written at the 1-hour TTL tier (billed at 2× input rate).
+        /// Zero for old DB records that pre-date this field; those are priced at the 5-min rate as before.
+        #[serde(default)]
+        cache_creation_1h_input_tokens: u64,
         total_tokens: u64,
     },
     Other {
@@ -64,7 +68,7 @@ impl Event {
                 cache_creation_input_tokens,
                 cache_read_input_tokens,
                 ..
-            } => Some(input_tokens + output_tokens + cache_creation_input_tokens + cache_read_input_tokens),
+            } => Some(input_tokens + output_tokens + cache_creation_input_tokens + cache_read_input_tokens), // cache_creation_1h is a subset, not additive
             _ => None,
         }
     }
