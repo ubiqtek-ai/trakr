@@ -148,12 +148,14 @@ fn run_migrations(conn: &Connection) -> Result<()> {
             }
         }
         conn.execute(
-            "INSERT INTO schema_migrations (version, applied_at) VALUES (2, ?1)",
+            "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (2, ?1)",
             rusqlite::params![Utc::now().to_rfc3339()],
         ).context("recording migration v2")?;
     }
 
     // v3 — add last_activity_at, file_size, file_mtime to sessions.
+    //
+    // (v4 is below)
     //
     // `last_activity_at`: the timestamp of the last transcript event seen during backfill.
     //   Distinct from `ended_at`, which is written only by the SessionEnd hook and records a
@@ -181,9 +183,36 @@ fn run_migrations(conn: &Connection) -> Result<()> {
                 .context("migration v3: adding column file_size")?;
         }
         conn.execute(
-            "INSERT INTO schema_migrations (version, applied_at) VALUES (3, ?1)",
+            "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (3, ?1)",
             rusqlite::params![Utc::now().to_rfc3339()],
         ).context("recording migration v3")?;
+    }
+
+    // v4 — add request_id column + unique partial index to events.
+    //
+    // `request_id` is set only for `background_api_call` events (Anthropic API request ID from
+    // OTEL logs). The unique partial index enforces dedup: INSERT OR IGNORE on the same
+    // request_id is a no-op, so replayed OTEL batches cannot double-count.
+    if !applied.contains(&4) {
+        let existing_cols: std::collections::HashSet<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(events)")?;
+            let cols = stmt.query_map([], |row| row.get::<_, String>(1))?
+                .filter_map(|r| r.ok())
+                .collect();
+            cols
+        };
+        if !existing_cols.contains("request_id") {
+            conn.execute_batch("ALTER TABLE events ADD COLUMN request_id TEXT;")
+                .context("migration v4: adding request_id column")?;
+        }
+        conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_events_request_id \
+             ON events (request_id) WHERE request_id IS NOT NULL;"
+        ).context("migration v4: creating request_id unique index")?;
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (4, ?1)",
+            rusqlite::params![Utc::now().to_rfc3339()],
+        ).context("recording migration v4")?;
     }
 
     Ok(())
@@ -227,6 +256,58 @@ pub fn insert_event(session_id: &str, event: &Event, timestamp: DateTime<Utc>) -
         .context("writing to JSONL file")?;
 
     Ok(())
+}
+
+/// Insert a `BackgroundApiCall` event with dedup on `request_id`.
+///
+/// Uses INSERT OR IGNORE so replayed OTEL batches are silently dropped.
+/// Does NOT write to the per-session JSONL backup (these events come from OTEL, not hooks).
+pub fn insert_background_api_call(
+    session_id: &str,
+    event: &Event,
+    timestamp: DateTime<Utc>,
+) -> Result<()> {
+    let request_id = match event {
+        Event::BackgroundApiCall { request_id, .. } => request_id.clone(),
+        _ => anyhow::bail!("insert_background_api_call called with non-BackgroundApiCall event"),
+    };
+
+    let payload = serde_json::to_string(event).context("serialising background_api_call event")?;
+    let ts = timestamp.to_rfc3339();
+
+    let conn = open_db()?;
+    conn.execute(
+        "INSERT OR IGNORE INTO events (session_id, timestamp, event_type, payload, request_id) \
+         VALUES (?1, ?2, 'background_api_call', ?3, ?4)",
+        params![session_id, ts, payload, request_id],
+    )
+    .context("inserting background_api_call event")?;
+
+    Ok(())
+}
+
+/// Sum `cost_usd` from all `background_api_call` events in the given `YYYY-MM` month.
+///
+/// Returns 0.0 if OTEL is not enabled or no data has arrived yet.
+pub fn get_monthly_background_spend_usd(year_month: &str) -> Result<f64> {
+    let conn = open_db()?;
+    let mut stmt = conn.prepare(
+        "SELECT payload FROM events \
+         WHERE event_type = 'background_api_call' \
+         AND strftime('%Y-%m', timestamp) = ?1",
+    )?;
+    let payloads: Vec<String> = stmt
+        .query_map(params![year_month], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut total = 0.0f64;
+    for payload in payloads {
+        let Ok(event) = serde_json::from_str::<Event>(&payload) else { continue };
+        if let Event::BackgroundApiCall { cost_usd, .. } = event {
+            total += cost_usd;
+        }
+    }
+    Ok(total)
 }
 
 /// Query events from the unified DB.
@@ -521,8 +602,13 @@ pub fn replace_session(
 
     conn.execute_batch("BEGIN;")?;
 
-    conn.execute("DELETE FROM events WHERE session_id = ?1", params![session_id])
-        .context("deleting existing events in transaction")?;
+    // Preserve background_api_call events — they come from OTEL, not the transcript,
+    // and are not re-emitted on replay.
+    conn.execute(
+        "DELETE FROM events WHERE session_id = ?1 AND event_type != 'background_api_call'",
+        params![session_id],
+    )
+    .context("deleting existing events in transaction")?;
 
     for (ts, event) in events {
         let payload = serde_json::to_string(event).context("serialising event")?;
@@ -548,10 +634,12 @@ pub fn replace_session(
 }
 
 /// Deletes all events for the given session from the DB and removes the JSONL backup if present.
+///
+/// `background_api_call` events are preserved — they come from OTEL and are not re-emitted.
 pub fn delete_events_for_session(session_id: &str) -> Result<()> {
     let conn = open_db()?;
     conn.execute(
-        "DELETE FROM events WHERE session_id = ?1",
+        "DELETE FROM events WHERE session_id = ?1 AND event_type != 'background_api_call'",
         params![session_id],
     )
     .context("deleting events for session")?;

@@ -225,16 +225,42 @@ Events recorded: `tool_use`, `session_start`, `session_end`, `token_usage`, `sub
 
 ## Cost estimation
 
-Rates used (June 2026 Anthropic rate card):
+Rates are fetched daily from the [LiteLLM price list](https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json) and cached to `~/.trakr/rates.json`. Run `trakr sync-rates` to refresh manually. A hardcoded fallback is used if the cache is absent.
 
-| Model | Input /MTok | Output /MTok |
-|---|---|---|
-| Haiku 4.5 | $1.00 | $5.00 |
-| Sonnet 4.6 | $3.00 | $15.00 |
-| Opus 4.7 / 4.8 | $5.00 | $25.00 |
-| Fable 5 | $10.00 | $50.00 |
+Fallback rates (June 2026 Anthropic published pricing):
 
-Cache read is billed at 10% of the input rate. Cache creation is billed at the full input rate. Unknown models fall back to Sonnet rates.
+| Model | Input /MTok | Output /MTok | Cache read /MTok | Cache write 5m /MTok | Cache write 1h /MTok |
+|---|---|---|---|---|---|
+| Haiku 4.5 | $1.00 | $5.00 | $0.10 | $1.25 | $2.00 |
+| Sonnet 4.6 | $3.00 | $15.00 | $0.30 | $3.75 | $6.00 |
+| Opus 4.7/4.8 | $5.00 | $25.00 | $0.50 | $6.25 | $10.00 |
+| Fable 5 | $10.00 | $50.00 | $1.00 | $12.50 | $20.00 |
+
+Claude Code uses two cache TTL tiers. The 1-hour tier (dominant in Claude Code — typically 70–85% of all cache writes) costs **2× the input rate**. The 5-minute tier costs **1.25×**. trakr reads the per-tier split from `usage.cache_creation.{ephemeral_1h_input_tokens, ephemeral_5m_input_tokens}` in each session transcript and prices them separately.
+
+Unknown models fall back to Sonnet rates.
+
+---
+
+## Spend accuracy
+
+trakr reads token usage directly from Claude Code's session transcripts — the same files Claude Code writes locally. This makes it accurate for everything that happens inside a session, including subagents.
+
+**What trakr counts:**
+- All `assistant` turns in main session files (deduped by `message.id` to avoid double-counting multi-block responses)
+- All subagent files at `~/.claude/projects/<slug>/<uuid>/subagents/agent-*.jsonl`
+- Both 1-hour and 5-minute cache creation tiers, priced separately
+
+**Known gap (~5–10% of monthly spend):**
+Claude Code makes background API calls — for session title generation (`ai-title`), compact summary generation, and similar housekeeping — that are billed by Anthropic but **never written to the local session transcript**. These are typically Haiku calls and account for the remaining gap between trakr's figure and the Anthropic dashboard. There is no way to capture these from transcripts alone.
+
+**Comparison with other local trackers**
+Some local trackers apply a calibration factor (e.g. 0.71×) to reconcile raw computed cost with Anthropic billing. This factor compensates for bugs in those tools — specifically, not deduplicating API responses by `message.id` (each multi-block assistant response is counted 2–3×) and using incorrect/outdated model prices. trakr fixes both issues at the source, so no calibration factor is needed. The remaining ~9% gap is from genuinely invisible background calls, not from overcounting.
+
+**Future: Anthropic Analytics API**
+Anthropic exposes an org-level Analytics API (`GET /v1/organizations/analytics/cost_report`) that returns pre-calculated spend figures in cents — authoritative billing data with no token multiplication required. Users with an org admin API key (`read:analytics` scope) could use this to close the gap entirely. This is planned as an optional "exact mode" for trakr (see roadmap in `doc/planning/plan.md`).
+
+If you need exact figures today, the [Anthropic usage dashboard](https://console.anthropic.com) or a tool with Analytics API access is the authoritative source.
 
 ---
 

@@ -136,6 +136,19 @@ enum Commands {
     Sync,
     /// Fetch current model pricing from LiteLLM and update ~/.trakr/rates.json
     SyncRates,
+    /// Manage OTEL telemetry integration (optional background-spend gap-fill)
+    Otel {
+        #[command(subcommand)]
+        action: OtelAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum OtelAction {
+    /// Enable OTEL: write env vars to ~/.claude/settings.json, set otel_enabled=true, restart daemon
+    Enable,
+    /// Disable OTEL: remove env vars from ~/.claude/settings.json, set otel_enabled=false, restart daemon
+    Disable,
 }
 
 fn main() {
@@ -174,6 +187,10 @@ fn run(cli: Cli) -> Result<()> {
         Commands::Archive => cmd_archive(),
         Commands::Sync => cmd_sync(),
         Commands::SyncRates => cmd_sync_rates(),
+        Commands::Otel { action } => match action {
+            OtelAction::Enable  => cmd_otel_enable(),
+            OtelAction::Disable => cmd_otel_disable(),
+        },
     }
 }
 
@@ -527,6 +544,9 @@ fn cmd_show(session_id: &str) -> Result<()> {
             }
             Event::ContextCompression { before_tokens, after_tokens } => {
                 format!("before={} after={}", before_tokens, after_tokens)
+            }
+            Event::BackgroundApiCall { model, cost_usd, query_source, .. } => {
+                format!("model={} cost=${:.4} source={}", model, cost_usd, query_source)
             }
             Event::Other { hook_event_name, .. } => {
                 format!("hook={}", hook_event_name)
@@ -1131,24 +1151,27 @@ fn peek_session_id(path: &std::path::Path) -> Option<String> {
     None
 }
 
-fn cmd_serve(api_port_override: Option<u16>, _otel_port_override: Option<u16>) -> Result<()> {
+fn cmd_serve(api_port_override: Option<u16>, otel_port_override: Option<u16>) -> Result<()> {
     use trakr::config;
     use trakr::otel_receiver;
     use trakr::server::{AppState, start_server};
 
     let cfg = config::load_config()?;
     let api_port = api_port_override.unwrap_or(cfg.api_port);
+    let otel_port = otel_port_override.unwrap_or(cfg.otel_port);
 
     storage::init_db()?;
 
     let trakr_dir = dirs::home_dir().map(|p| p.join(".trakr").display().to_string()).unwrap_or_else(|| "unknown".to_string());
-    tlog!("trakr: daemon starting  budget=${:.2}  sync={}s  api={}  home={}",
+    tlog!("trakr: daemon starting  budget=${:.2}  sync={}s  api={}  otel={}  home={}",
         cfg.monthly_budget_usd,
         cfg.sync_interval_secs,
         if cfg.api_enabled { format!("enabled (:{} )", cfg.api_port) } else { "disabled".to_string() },
+        if cfg.otel_enabled { format!("enabled (:{})", otel_port) } else { "disabled".to_string() },
         trakr_dir,
     );
 
+    let otel_enabled = cfg.otel_enabled;
     let rt = tokio::runtime::Runtime::new().context("creating tokio runtime")?;
     rt.block_on(async move {
         let costs = otel_receiver::new_session_costs();
@@ -1159,6 +1182,10 @@ fn cmd_serve(api_port_override: Option<u16>, _otel_port_override: Option<u16>) -
         };
 
         let sync_interval = cfg.sync_interval_secs;
+
+        if otel_enabled {
+            tokio::spawn(otel_receiver::start_otel_receiver(otel_port, costs.clone()));
+        }
 
         tokio::spawn(async move {
             loop {
@@ -1251,33 +1278,40 @@ fn cmd_spend(json: bool) -> Result<()> {
 
     storage::init_db()?;
 
+    let background = if cfg.otel_enabled {
+        storage::get_monthly_background_spend_usd(&year_month).unwrap_or(0.0)
+    } else {
+        0.0
+    };
+
     if json {
         // Fast path: DB read only, no reconciliation. The serve daemon keeps the DB current.
         let (spent, count) = storage::get_monthly_spend_usd(&year_month)?;
-        let pct = if cfg.monthly_budget_usd > 0.0 { spent / cfg.monthly_budget_usd * 100.0 } else { 0.0 };
+        let total = spent + background;
+        let pct = if cfg.monthly_budget_usd > 0.0 { total / cfg.monthly_budget_usd * 100.0 } else { 0.0 };
         println!(
-            r#"{{"month":"{month}","spent_usd":{spent:.2},"budget_usd":{budget:.2},"pct":{pct:.1},"sessions":{count}}}"#,
-            month  = year_month,
-            spent  = spent,
-            budget = cfg.monthly_budget_usd,
-            pct    = pct,
-            count  = count,
+            r#"{{"month":"{month}","spent_usd":{spent:.2},"background_usd":{background:.2},"total_usd":{total:.2},"budget_usd":{budget:.2},"pct":{pct:.1},"sessions":{count}}}"#,
+            month      = year_month,
+            spent      = spent,
+            background = background,
+            total      = total,
+            budget     = cfg.monthly_budget_usd,
+            pct        = pct,
+            count      = count,
         );
         return Ok(());
     }
 
-    // B4: always use SQLite — no OTEL term, no live-API-vs-SQLite split.
-    // Run one inline incremental sweep before reading; sub-second when nothing changed
-    // because the change-detection logic skips unchanged sessions without a full re-parse.
+    // Run one inline incremental sweep before reading; sub-second when nothing changed.
     if let Err(e) = run_log_reconciliation() {
         eprintln!("trakr: reconciliation warning: {:#}", e);
     }
-    // Stats from the inline sweep are intentionally discarded here.
 
     let (spent, count) = storage::get_monthly_spend_usd(&year_month)?;
+    let total = spent + background;
     let now_local = chrono::Local::now();
     let month_label = now_local.format("%B %Y").to_string();
-    let pct = if cfg.monthly_budget_usd > 0.0 { spent / cfg.monthly_budget_usd * 100.0 } else { 0.0 };
+    let pct = if cfg.monthly_budget_usd > 0.0 { total / cfg.monthly_budget_usd * 100.0 } else { 0.0 };
     let day = now_local.day();
     let suffix = match day % 100 {
         11 | 12 | 13 => "th",
@@ -1293,13 +1327,25 @@ fn cmd_spend(json: bool) -> Result<()> {
     const LW: usize = 12;
     const VW: usize = 10;
     const W: usize = 2 + LW + 1 + VW;
-    let cost_val   = format!("{:>width$}", format!("${:.2}", spent),                  width = VW);
+
     let budget_val = format!("{:>width$}", format!("${:.2}", cfg.monthly_budget_usd), width = VW);
     let used_val   = format!("{:>width$}", format!("{:.1}%", pct),                    width = VW);
 
     println!("Spend for {} ({} sessions)", month_label, count);
     println!("{}", "-".repeat(W));
-    println!("  {:<width$} {}", "Cost",   cost_val,   width = LW);
+
+    if background > 0.0 {
+        let transcript_val = format!("{:>width$}", format!("${:.2}", spent),      width = VW);
+        let background_val = format!("{:>width$}", format!("${:.2}", background), width = VW);
+        let total_val      = format!("{:>width$}", format!("${:.2}", total),      width = VW);
+        println!("  {:<width$} {}", "Transcripts", transcript_val, width = LW);
+        println!("  {:<width$} {}", "Background",  background_val, width = LW);
+        println!("  {:<width$} {}", "Total",        total_val,      width = LW);
+    } else {
+        let cost_val = format!("{:>width$}", format!("${:.2}", spent), width = VW);
+        println!("  {:<width$} {}", "Cost", cost_val, width = LW);
+    }
+
     println!("  {:<width$} {}", "Budget", budget_val, width = LW);
     println!("  {:<width$} {}", "Used",   used_val,   width = LW);
     println!("{}", "-".repeat(W));
@@ -1495,6 +1541,14 @@ fn cmd_status() -> Result<()> {
     } else {
         println!("  {} {:<32} disabled (set api_enabled = true in config.toml to enable)",
             info(false), "API server");
+    }
+
+    if cfg.otel_enabled {
+        println!("  {} {:<32} enabled on port {} (receiving OTLP metrics + logs)",
+            info(true), "OTEL receiver", cfg.otel_port);
+    } else {
+        println!("  {} {:<32} disabled — run `trakr otel enable` to start gap-fill",
+            info(false), "OTEL receiver");
     }
 
     // ── Summary ────────────────────────────────────────────────────────────────
@@ -1806,6 +1860,114 @@ fn cmd_logs(lines: usize) -> Result<()> {
 
     Ok(())
 }
+
+// ── OTEL enable / disable ─────────────────────────────────────────────────────
+
+const OTEL_ENV_KEYS: &[&str] = &[
+    "CLAUDE_CODE_ENABLE_TELEMETRY",
+    "OTEL_METRICS_EXPORTER",
+    "OTEL_LOGS_EXPORTER",
+    "OTEL_EXPORTER_OTLP_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_PROTOCOL",
+];
+
+fn claude_settings_path() -> Result<std::path::PathBuf> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
+    Ok(home.join(".claude").join("settings.json"))
+}
+
+fn merge_otel_env_to_claude_settings(otel_port: u16) -> Result<()> {
+    let path = claude_settings_path()?;
+    let mut settings: serde_json::Value = if path.exists() {
+        serde_json::from_str(&std::fs::read_to_string(&path)?)?
+    } else {
+        serde_json::json!({})
+    };
+
+    if settings.get("env").is_none() {
+        settings["env"] = serde_json::json!({});
+    }
+    let env = settings["env"].as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("settings.json 'env' is not an object"))?;
+
+    env.insert("CLAUDE_CODE_ENABLE_TELEMETRY".into(), "1".into());
+    env.insert("OTEL_METRICS_EXPORTER".into(), "otlp".into());
+    env.insert("OTEL_LOGS_EXPORTER".into(), "otlp".into());
+    env.insert("OTEL_EXPORTER_OTLP_ENDPOINT".into(), format!("http://localhost:{}", otel_port).into());
+    env.insert("OTEL_EXPORTER_OTLP_PROTOCOL".into(), "http/json".into());
+
+    std::fs::write(&path, serde_json::to_string_pretty(&settings)?)?;
+    Ok(())
+}
+
+fn remove_otel_env_from_claude_settings() -> Result<()> {
+    let path = claude_settings_path()?;
+    if !path.exists() {
+        return Ok(());
+    }
+    let mut settings: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+    if let Some(env) = settings.get_mut("env").and_then(|v| v.as_object_mut()) {
+        for key in OTEL_ENV_KEYS {
+            env.remove(*key);
+        }
+    }
+    std::fs::write(&path, serde_json::to_string_pretty(&settings)?)?;
+    Ok(())
+}
+
+fn cmd_otel_enable() -> Result<()> {
+    use trakr::config;
+
+    let mut cfg = config::load_config()?;
+    if cfg.otel_enabled {
+        println!("OTEL is already enabled (port {}).", cfg.otel_port);
+        println!("Start a new Claude Code session if you have not done so already.");
+        return Ok(());
+    }
+
+    cfg.otel_enabled = true;
+    config::save_config(&cfg)?;
+    println!("  config.toml updated  otel_enabled = true  otel_port = {}", cfg.otel_port);
+
+    merge_otel_env_to_claude_settings(cfg.otel_port)?;
+    println!("  ~/.claude/settings.json  OTEL env vars written");
+
+    cmd_uninstall_service()?;
+    cmd_install_service()?;
+
+    println!();
+    println!("OTEL enabled.");
+    println!("Start a NEW Claude Code session — env vars only apply to fresh sessions.");
+    println!("Raw OTEL payloads are dumped to:");
+    println!("  ~/.trakr/otel-dump-metrics.jsonl");
+    println!("  ~/.trakr/otel-dump-logs.jsonl");
+    Ok(())
+}
+
+fn cmd_otel_disable() -> Result<()> {
+    use trakr::config;
+
+    let mut cfg = config::load_config()?;
+    if !cfg.otel_enabled {
+        println!("OTEL is already disabled.");
+        return Ok(());
+    }
+
+    cfg.otel_enabled = false;
+    config::save_config(&cfg)?;
+    println!("  config.toml updated  otel_enabled = false");
+
+    remove_otel_env_from_claude_settings()?;
+    println!("  ~/.claude/settings.json  OTEL env vars removed");
+
+    cmd_uninstall_service()?;
+    cmd_install_service()?;
+
+    println!("OTEL disabled.");
+    Ok(())
+}
+
+// ── LaunchAgent service management ────────────────────────────────────────────
 
 const LAUNCH_AGENT_LABEL: &str = "io.ubiqtek.trakr.serve";
 

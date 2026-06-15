@@ -38,6 +38,20 @@ pub enum Event {
         cache_creation_1h_input_tokens: u64,
         total_tokens: u64,
     },
+    /// A background API call made by Claude Code that does not appear in session transcripts.
+    ///
+    /// Examples: title generation, compact-summary generation. These are captured via the OTEL
+    /// log stream (`claude_code.api_request` records where `query_source != "repl_main_thread"`)
+    /// and stored here so spend queries pick them up automatically.
+    ///
+    /// `request_id` is the Anthropic API request ID and serves as a dedup key — stored in the
+    /// `events.request_id` column with a unique partial index.
+    BackgroundApiCall {
+        request_id: String,
+        model: String,
+        cost_usd: f64,
+        query_source: String,
+    },
     Other {
         hook_event_name: String,
         payload: serde_json::Value,
@@ -55,6 +69,7 @@ impl Event {
             Event::SubagentStop { .. } => "subagent_stop",
             Event::ContextCompression { .. } => "context_compression",
             Event::TokenUsage { .. } => "token_usage",
+            Event::BackgroundApiCall { .. } => "background_api_call",
             Event::Other { .. } => "other",
         }
     }

@@ -1,9 +1,9 @@
 # Implementation Plan
 
 ## ── WHAT'S NEXT ──────────────────────────────────────────────────────────
-**Next:** Action 4d.3 — surface `title` + `summary` in `trakr list` and `trakr show`
-**Sub-doc:** (none)
-**Blockers:** None (spend gap root cause identified and fixed; Haiku background-call gap documented as known limitation)
+**Next:** Action 5.6 Phase D — UX polish: README "Optional: OTEL gap-fill" section; `trakr status` warn if OTEL enabled but no batches in >90 s
+**Sub-doc:** `doc/planning/otel-gap-fill-plan.md`
+**Blockers:** None
 ─────────────────────────────────────────────────────────────────────────────
 
 ## Phase 1: Project Foundation
@@ -226,84 +226,52 @@ Key findings:
 ### Action 5.4: CodeQL static analysis
 - TODO - Set up CodeQL on this repo (reference: `~/projects/tsk` already has it configured)
 
+### Action 5.6: OTEL gap-fill (optional ~9% accuracy improvement)
+Design doc: `doc/planning/otel-gap-fill-plan.md`
+
+#### Phase A — Attribute dump experiment (gates design choice)
+- ✓ DONE - Instrument `handle_metrics` to write raw OTEL body to `~/.trakr/otel-dump-metrics.jsonl`
+- ✓ DONE - Add `/v1/logs` route writing to `~/.trakr/otel-dump-logs.jsonl`
+- ✓ DONE - Ran fresh Claude Code session with telemetry enabled; read the dumps
+- ✓ DONE - Key finding: `claude_code.api_request` log records carry `query_source` (`repl_main_thread` vs `generate_session_title`, `auxiliary`, etc.), `request_id`, `cost_usd` — no dedup or subtraction needed
+- ✓ DONE - Branch chosen: new "Option 4" — filter log records by `query_source != "repl_main_thread"`; use `cost_usd` directly
+- NOTE - Full findings documented in `doc/otel-telemetry-schema.md`
+
+#### Phase B — Config flag & CLI (parallel with A)
+- ✓ DONE - `src/config.rs`: add `otel_enabled: bool` + `otel_port: u16` (default false / 4318, `#[serde(default)]`; `save_config()` added)
+- ✓ DONE - `trakr otel enable`: set flag, write OTEL env vars to `~/.claude/settings.json` (including `OTEL_LOGS_EXPORTER=otlp`), restart daemon
+- ✓ DONE - `trakr otel disable`: clear flag, remove env vars, restart daemon
+- ✓ DONE - `cmd_serve`: gate OTEL receiver start on `config.otel_enabled`; uses configured `otel_port`
+- ✓ DONE - `trakr status`: show OTEL as disabled when flag off; show port when on
+- NOTE - Commands named `enable`/`disable` (not `install`/`uninstall` as originally planned)
+
+#### Phase C — Gap-fill logic
+- ✓ DONE - `Event::BackgroundApiCall { request_id, model, cost_usd, query_source }` added to `src/event.rs`
+- ✓ DONE - Migration v4: `request_id TEXT` column on events + unique partial index for dedup
+- ✓ DONE - `storage::insert_background_api_call` — INSERT OR IGNORE on `request_id`
+- ✓ DONE - `storage::get_monthly_background_spend_usd` — sums background costs for month
+- ✓ DONE - `replace_session` / `delete_events_for_session` exclude `background_api_call` rows (survive reconciliation)
+- ✓ DONE - `otel_receiver::handle_logs` fully implemented: parses `claude_code.api_request`, filters non-`repl_main_thread`, stores via `spawn_blocking`
+- ✓ DONE - `trakr spend`: shows Transcripts / Background / Total breakdown when OTEL data present; Cost only when no background data
+- ✓ DONE - `trakr spend --json`: adds `background_usd` and `total_usd` fields
+- ✓ DONE - 4 new unit tests in `otel_receiver.rs` (skip main thread, capture title-gen, capture auxiliary, skip zero-cost)
+- ✓ DONE - `trakr v0.1.5` published to crates.io; 73 tests passing
+
+#### Phase D — UX polish
+- TODO - README: "Optional: OTEL gap-fill" section
+- TODO - `trakr status`: warn if OTEL enabled but no batches received in >90 s
+
+### Action 5.5: Anthropic Analytics API integration (optional "exact mode")
+- TODO - `GET /v1/organizations/analytics/cost_report` — returns pre-calculated spend in cents; no token multiplication needed
+- TODO - Auth: `x-api-key` with `read:analytics` scope (org admin key — not available to all users)
+- TODO - `trakr sync-analytics` command — fetches and stores authoritative spend figures, replacing transcript estimates for the covered period
+- TODO - `trakr spend --exact` flag — uses Analytics API figures when available, falls back to transcript-based estimate
+- NOTE - This closes the ~9% gap from invisible background API calls (title/summary generation) that never appear in local session transcripts
+- NOTE - Requires org-level API key; transcript-based tracking remains the default for users without one
+- NOTE - Per-user endpoint: `GET /analytics/cost_report?user_ids[]=<id>&bucket_width=1d` — allows per-user filtering within an org
+
 ---
 
-## ── CHECKPOINT: Session 2026-06-11 (OTEL verified end-to-end + README) ────
-
-**What was completed this session:**
-- OTEL pipeline verified end-to-end for the first time with a real Claude Code session:
-  - `trakr init` env vars (`CLAUDE_CODE_ENABLE_TELEMETRY`, `OTEL_METRICS_EXPORTER`, `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_PROTOCOL=http/json`) confirmed picked up by a fresh session
-  - Receiver on :4318 ingested live batches; `trakr status` showed `✓ OTEL receiver — 1 batches, 1 active session(s), $0.27`
-  - `trakr spend` showed the live line for the first time: 42 completed ($329.69) + active ($0.27) = $329.96, no double-counting
-  - Key operational learning (now in README): env changes apply only to NEW sessions, and the first metrics batch lands ~60 s in (Claude Code's export interval) — `trakr status` correctly flags this window as a problem until the first batch arrives
-- README rewritten to match the current architecture (closes both remaining Action 5.2 TODOs):
-  - `trakr` binary name, `~/.trakr/` paths, API port 8788, SessionStart/SessionEnd-only hooks
-  - Quick start reflects that `init` now writes hooks AND env vars itself; added the new-session restart step
-  - New sections: "How tracking works" (SessionEnd transcript parse, OTEL gap-fill, reconciliation sweep) and "Troubleshooting"
-  - Documented `status`, `install-service`/`uninstall-service`, `logs`, `backfill-logs`, `inspect-logs`, `show-prompts`; updated storage layout (transcripts/, serve.log, sessions table columns)
-
-**State of the project:**
-- Full pipeline live: launchd service running `trakr serve` (API :8788, OTEL :4318), hooks rolling sessions into SQLite, OTEL feeding active-session spend. `trakr status` passes all checks. No code changes this session (docs + verification only); binary unchanged, 54 tests passing.
-- Untested seam: the active→completed handoff (live cost dropping out of the OTEL total once SessionEnd lands) hasn't been observed for the verifying session yet — worth a glance at the next `trakr spend`.
-
-**Immediate next priorities:**
-1. Action 4d.3 — surface `title`/`summary` in `trakr list` and `trakr show`
-2. Verify active→completed spend handoff (no double-count, no gap) after a tracked session ends
-3. Filtering/JSON output on `list`, `show`, `stats`
-4. CI/CD and crates.io publication
-
-─────────────────────────────────────────────────────────────────────────────
-
-## ── CHECKPOINT: Session 2026-06-13 (architecture redesign + single-ledger plan) ────
-
-**What was completed this session:**
-- Identified critical bugs in current spend pipeline: ~2.3× output token overstatement (usage duplicated per content block, no `message.id` dedupe) and ~19% usage invisibility (subagent files never scanned)
-- Empirical corpus analysis: 126 JSONL files, 61 MB, 23 projects — measured impact in `doc/transcript-structure.md` §3
-- Architectural decision: **OTEL and hooks parked** — Claude's transcripts are now the single spend source; dual-pipeline complexity eliminated
-- New docs written:
-  - `doc/session-lifecycle.md` — three-category session model (known-complete / active / ended-unhooked), 2026-06-11 reconciliation bug
-  - `doc/event-sourced-sessions.md` — event sourcing design principles (event store = observed facts only; spend never keys on endings; projection table for derived state)
-  - `doc/transcript-structure.md` — empirical format analysis, 2× overstatement finding, three-layer architecture, archive strategy (two decoupled loops)
-  - `doc/planning/single-ledger-plan.md` — self-contained Sonnet execution plan for all four phases (A: parser, B: serve loop, C: archive, D: docs)
-  - `doc/README.md` — indexed all new docs
-- Interim code changes (to be superseded by single-ledger plan):
-  - `src/server.rs`: `active_sessions_count` field added to spend response
-  - `src/main.rs`: spend CLI shows "Active sessions (N)"; `backfill-logs --force` flag; `[live?]` skip counter
-  - `src/backfill.rs`: `looks_active()` mtime guard (`ACTIVE_LOG_WINDOW = 24h`); 3 tests
-
-**State of the project:**
-- `trakr serve` still running old binary (launchd service not restarted); working-tree changes uncommitted. `trakr spend` shows ~$330 (likely ~$150–170 real, given the 2.3× overstatement). `cargo build` clean; 54 tests passing (3 new from liveness guard). Two sessions wrongly stamped `session_end` by backfill on 2026-06-11 — will self-heal when they genuinely end.
-
-**Immediate next priorities:**
-1. Implement Phase A of `planning/single-ledger-plan.md` — fix dedupe, per-model pricing, subagent inclusion, spend query (the money bugs)
-2. Implement Phase B — backfill never writes `session_end`, remove liveness guard, 30 s sampling loop, drop OTEL term from spend endpoint
-3. Implement Phase C — `src/archive.rs`, `trakr archive` command, daily timer in serve
-4. Run `trakr repair --dry-run` and report; leave the real repair run to Jim
-5. Action 4d.3 (title/summary in `list`/`show`) — deprioritised pending single-ledger work
-
-─────────────────────────────────────────────────────────────────────────────
-
-## ── CHECKPOINT: Session 2026-06-13 (single-ledger implementation) ────────
-
-**What was completed this session:**
-- Phase A: parser correctness — dedupe by message.id, per-model TokenUsage, subagent inclusion, spend query rewritten (no session_end filter)
-- Phase B: backfill never writes session_end; liveness guard removed; 30s reconciliation loop in serve; repair command; OTEL demoted to informational
-- Phase C: src/archive.rs — daily archive sweep mirroring ~/.claude/projects/ → ~/.trakr/archive/
-- 66 tests passing; cargo build warning-free
-- Before/after spend: $214.19 → $104.82 (2.04× reduction from dedupe fix)
-
-**State of the project:**
-- trakr serve runs reconciliation every 30s and archive daily; spend is accurate from transcripts alone
-- trakr repair --dry-run shows 58 sessions to rebuild (51 with synthetic session_end from old backfill)
-- OTEL receiver still compiles and runs but is informational only
-
-**Immediate next priorities:**
-1. Jim to run `trakr repair --run` to rebuild spend from clean transcripts
-2. Action 4d.3 — surface title/summary in `trakr list` and `trakr show`
-3. Filtering/JSON output on `list`, `show`, `stats`
-4. CI/CD and crates.io publication
-
-─────────────────────────────────────────────────────────────────────────────
 
 ## ── CHECKPOINT: Session 2026-06-14 (single-ledger complete + UX polish) ────
 
@@ -459,6 +427,28 @@ Key findings:
 
 ─────────────────────────────────────────────────────────────────────────────
 
+## ── CHECKPOINT: Session 2026-06-15 (OTEL gap-fill plan + doc updates) ──────────
+
+**What was completed this session:**
+- Remaining ~9% spend gap ($232 vs $255.50) diagnosed as background Haiku API calls (title/summary generation) invisible to transcripts
+- Anthropic Analytics API documented (`/v1/organizations/analytics/cost_report`) — org admin key required, not available; added as Action 5.5
+- `claude-usage-tracker` 0.71 calibration factor analysed: compensates for no `message.id` dedup + wrong model prices in that tool — not a fundamental pricing truth; trakr fixes at source
+- README updated: cache rate table corrected (1h=2×, 5m=1.25×), "Spend accuracy" section added (known gap, background calls, comparison with other trackers, future Analytics API)
+- `doc/planning/otel-gap-fill-plan.md` written: full phased plan for optional OTEL gap-fill (Phase A dump experiment → Phase B config/CLI → Phase C Option 2 or 3 → Phase D UX)
+- Action 5.6 added to main plan; WHAT'S NEXT updated to point at Phase A experiment
+
+**State of the project:**
+- `trakr v0.1.4` built locally (not yet published); 68 tests passing; spend $232/month vs $255.50 Anthropic (~9% gap, documented as known limitation)
+- OTEL gap-fill fully designed but not yet implemented; next step is the attribute dump experiment to choose between Option 2 (per-request-id dedup) and Option 3 (per-model token subtraction)
+
+**Immediate next priorities:**
+1. Publish v0.1.4 (1h cache tier fix)
+2. Action 5.6 Phase A — OTEL attribute dump experiment (30 min, gates all subsequent OTEL work)
+3. Action 5.6 Phase B — `otel_enabled` config flag + `trakr otel install/uninstall` CLI
+4. Action 4d.3 — `trakr list` with title + project; `trakr show` with title + summary
+
+─────────────────────────────────────────────────────────────────────────────
+
 ## ── CHECKPOINT: Session 2026-06-15 (1h cache tier pricing fix) ──────────────
 
 **What was completed this session:**
@@ -479,6 +469,57 @@ Key findings:
 2. Publish v0.1.4 with pricing fix
 3. Document Haiku background-call limitation in README / `trakr inspect` output
 4. Action 5.4 — CodeQL setup
+5. GitHub Actions CI/CD (Action 5.3)
+
+─────────────────────────────────────────────────────────────────────────────
+
+## ── CHECKPOINT: Session 2026-06-15 (OTEL Phase A+B implementation) ─────────
+
+**What was completed this session:**
+- `src/config.rs`: `otel_enabled: bool` + `otel_port: u16` added to `Config` (both with `#[serde(default)]`); `save_config()` added for programmatic config writes; 1 new test (`save_config_round_trips_otel_flag`)
+- `src/otel_receiver.rs`: `dump_to_jsonl()` helper appends raw OTLP bytes to `~/.trakr/` files; `handle_metrics` now dumps to `otel-dump-metrics.jsonl`; new `POST /v1/logs` route dumps to `otel-dump-logs.jsonl`
+- `src/main.rs`: `trakr otel enable` / `trakr otel disable` subcommands — update config, merge/remove 5 OTEL env vars in `~/.claude/settings.json`, restart launchd service; `cmd_serve` gates `start_otel_receiver` on `cfg.otel_enabled`; `trakr status` shows OTEL state
+- 69 tests passing (was 68); `cargo build` clean
+
+**State of the project:**
+- `trakr otel enable` is ready to use; running it will write env vars, restart the daemon, and begin capturing raw OTEL payloads to `~/.trakr/otel-dump-*.jsonl`
+- Phase A experiment not yet run — dumps are empty until a new Claude session fires telemetry
+- v0.1.4 still not published to crates.io (built locally, pricing fix included)
+
+**Immediate next priorities:**
+1. Start new session, run `trakr otel enable`, then use Claude Code for a few minutes and read the dumps — this gates Phase C branch choice
+2. Publish v0.1.4 to crates.io (1h cache tier pricing fix)
+3. Action 4d.3 — `trakr list` with title + project; `trakr show` with title + summary
+4. Action 5.4 — CodeQL setup (reference: `~/projects/tsk`)
+5. GitHub Actions CI/CD (Action 5.3)
+
+─────────────────────────────────────────────────────────────────────────────
+
+## ── CHECKPOINT: Session 2026-06-15 (OTEL gap-fill Phase A–C complete) ──────
+
+**What was completed this session:**
+- Phase A experiment run: captured live OTEL dumps, discovered `claude_code.api_request` log records carry `query_source` (`repl_main_thread` vs `generate_session_title`, `auxiliary`), `request_id`, and `cost_usd` — making Options 2 & 3 unnecessary
+- Full findings documented in `doc/otel-telemetry-schema.md` with example payloads
+- Phase C implemented as "Option 4" (filter by `query_source`, use `cost_usd` directly):
+  - `Event::BackgroundApiCall` variant added to `src/event.rs`
+  - Migration v4: `request_id` column + unique partial index on `events` (dedup)
+  - `storage::insert_background_api_call`, `get_monthly_background_spend_usd`
+  - `replace_session` / `delete_events_for_session` preserve `background_api_call` rows
+  - `otel_receiver::handle_logs` parses log batches and stores background calls live via `spawn_blocking`
+  - `trakr spend` shows Transcripts / Background / Total when OTEL data present; `--json` gains `background_usd` + `total_usd`
+  - 4 new tests in `otel_receiver.rs`; all migrations hardened with INSERT OR IGNORE
+- `trakr v0.1.5` published to crates.io; 73 tests passing; daemon restarted
+
+**State of the project:**
+- Background API calls (title generation, context preloading) now stored live as they arrive via OTEL; spend query picks them up automatically with no separate reconciliation loop
+- `trakr spend` will show a "Background" line once real background calls accumulate; currently 0 (calls appear within ~60 s of each new Claude Code session starting)
+- 73 tests passing; `cargo build` clean; launchd daemon running with OTEL enabled on port 4318
+
+**Immediate next priorities:**
+1. Phase D — README "Optional: OTEL gap-fill" section
+2. Phase D — `trakr status`: warn if OTEL enabled but no batches in >90 s
+3. Action 4d.3 — `trakr list` with title + project; `trakr show` with title + summary
+4. Action 5.4 — CodeQL setup (reference: `~/projects/tsk`)
 5. GitHub Actions CI/CD (Action 5.3)
 
 ─────────────────────────────────────────────────────────────────────────────

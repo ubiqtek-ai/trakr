@@ -1,8 +1,8 @@
 use anyhow::Result;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct Config {
     #[serde(default = "default_budget")]
     pub monthly_budget_usd: f64,
@@ -12,6 +12,10 @@ pub struct Config {
     pub api_enabled: bool,
     #[serde(default = "default_sync_interval_secs")]
     pub sync_interval_secs: u64,
+    #[serde(default)]
+    pub otel_enabled: bool,
+    #[serde(default = "default_otel_port")]
+    pub otel_port: u16,
 }
 
 fn default_budget() -> f64 {
@@ -23,6 +27,9 @@ fn default_api_port() -> u16 {
 fn default_sync_interval_secs() -> u64 {
     30
 }
+fn default_otel_port() -> u16 {
+    4318
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -31,6 +38,8 @@ impl Default for Config {
             api_port: default_api_port(),
             api_enabled: false,
             sync_interval_secs: default_sync_interval_secs(),
+            otel_enabled: false,
+            otel_port: default_otel_port(),
         }
     }
 }
@@ -58,7 +67,7 @@ pub fn write_default_config() -> Result<()> {
     if path.exists() {
         return Ok(());
     }
-    let content = r#"# ctx-trakr configuration
+    let content = r#"# trakr configuration
 
 # Monthly spend budget in USD. Shown in the status line as the denominator.
 monthly_budget_usd = 50.0
@@ -70,8 +79,24 @@ sync_interval_secs = 30
 # Enable if you want other processes (e.g. a UI) to query spend over HTTP.
 api_enabled = false
 api_port = 8788
+
+# OTEL telemetry receiver. Enable via `trakr otel enable`.
+otel_enabled = false
+otel_port = 4318
 "#;
     std::fs::write(&path, content)?;
+    Ok(())
+}
+
+/// Overwrite `~/.trakr/config.toml` with the given config struct.
+///
+/// Replaces the file entirely — any hand-written comments will be lost.
+/// Use this only from programmatic config-mutation commands (e.g. `trakr otel enable`).
+pub fn save_config(config: &Config) -> Result<()> {
+    let path = config_path()?;
+    let body = toml::to_string(config)
+        .map_err(|e| anyhow::anyhow!("serialising config: {}", e))?;
+    std::fs::write(&path, body)?;
     Ok(())
 }
 
@@ -102,6 +127,8 @@ mod tests {
             assert_eq!(cfg.monthly_budget_usd, 50.0);
             assert_eq!(cfg.api_port, 8788);
             assert!(!cfg.api_enabled);
+            assert!(!cfg.otel_enabled);
+            assert_eq!(cfg.otel_port, 4318);
             Ok(())
         })
         .unwrap();
@@ -134,6 +161,27 @@ mod tests {
             assert!(base.join("config.toml").exists());
             // Should be idempotent.
             write_default_config()?;
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn save_config_round_trips_otel_flag() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().join(".trakr");
+        fs::create_dir_all(&base).unwrap();
+
+        with_home(&tmp, || {
+            let mut cfg = load_config()?;
+            assert!(!cfg.otel_enabled);
+            cfg.otel_enabled = true;
+            cfg.otel_port = 9999;
+            save_config(&cfg)?;
+
+            let reloaded = load_config()?;
+            assert!(reloaded.otel_enabled);
+            assert_eq!(reloaded.otel_port, 9999);
             Ok(())
         })
         .unwrap();
