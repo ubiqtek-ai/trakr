@@ -1,8 +1,8 @@
 # Implementation Plan
 
 ## ── WHAT'S NEXT ──────────────────────────────────────────────────────────
-**Next:** Action 5.6 Phase D — `trakr status` warn if OTEL enabled but no batches received in >90 s
-**Sub-doc:** `doc/planning/otel-gap-fill-plan.md`
+**Next:** Action 4d.3 — `trakr list` with title + project; `trakr show` with title + summary
+**Sub-doc:** (none)
 **Blockers:** None
 ─────────────────────────────────────────────────────────────────────────────
 
@@ -266,8 +266,12 @@ Design doc: `doc/planning/otel-gap-fill-plan.md`
 - ✓ DONE - `storage::get_monthly_adjustment_usd(year_month)` — sums `cost_adjustment` events by timestamp month
 - ✓ DONE - `trakr adjust <day> <amount> [--reason "..."]` CLI command — positional `day` + `amount` (negative allowed via `allow_hyphen_values`); stored under session `"__adjustments__"` with `timestamp = <day>T00:00:00Z`
 - ✓ DONE - `trakr spend` shows Adjustment line (with `+`/`-` sign) when non-zero; contributes to Total; `--json` gains `adjustment_usd` field
-- ✓ DONE - `trakr init` enables OTEL by default: `write_default_config()` writes `otel_enabled = true`; `cmd_init` calls `merge_otel_env_to_claude_settings()` automatically
 - ✓ DONE - v0.1.6 version bumped in `Cargo.toml`
+- ✓ DONE - OTEL-by-default in `trakr init` reverted: enterprise CC accounts silently ignore standard `OTEL_*` env vars (early-return gate in binary); OTEL remains opt-in via `trakr otel enable`; config comment added noting enterprise limitation
+- ✓ DONE - `trakr init` hints added: "Run `trakr restart-service` if the service is already running"
+- ✓ DONE - `get_monthly_background_spend_usd` returns `(f64, usize)` — cost + call count; Background line in `trakr spend` now shows `$X.XX (N calls)`
+- ✓ DONE - `doc/otel-enterprise-investigation.md` added: full binary analysis, two OTEL code paths, workarounds considered and rejected
+- ✓ DONE - v0.1.7 / v0.1.8 / v0.1.9 bumped in `Cargo.toml`
 
 ### Action 5.5: Anthropic Analytics API integration (optional "exact mode")
 - TODO - `GET /v1/organizations/analytics/cost_report` — returns pre-calculated spend in cents; no token multiplication needed
@@ -279,37 +283,6 @@ Design doc: `doc/planning/otel-gap-fill-plan.md`
 - NOTE - Per-user endpoint: `GET /analytics/cost_report?user_ids[]=<id>&bucket_width=1d` — allows per-user filtering within an org
 
 ---
-
-
-## ── CHECKPOINT: Session 2026-06-14 (daemon polish + status line integration) ──
-
-**What was completed this session:**
-- Hooks removed: `write_hooks_to_settings()` and `suggested_hook_config()` deleted; `cmd_init` no longer writes hooks to `~/.claude/settings.json`; `~/.claude/settings.json` cleaned of `SessionStart`/`SessionEnd` hook entries
-- `trakr restart-service` command added (`cmd_uninstall_service` + `cmd_install_service`)
-- `tlog!` macro added for timestamped daemon logs (local time + UTC offset via `chrono::Local`)
-- Daemon startup/shutdown log lines: `daemon starting` (canonical: budget, sync interval, api state, home dir) and `daemon stopping` via SIGTERM handler
-- Reconciliation renamed to "syncing" throughout logs
-- API server made optional: `api_enabled` flag in config (default `false`); `std::future::pending::<()>().await` parks runtime when disabled
-- `sync_interval_secs` added to config (default 30s), wired into serve loop
-- `cmd_status` cleaned up: hook section removed, OTEL env vars removed, API shown as disabled, service section renamed
-- `doc/serve-daemon.md` created: documents daemon architecture, sync loop, SIGTERM handling, log format
-- `doc/README.md` updated: Architecture section added pointing to serve-daemon.md
-- `trakr spend --json` flag: fast DB-only path, outputs `{"spent":N,"budget":N,"pct":N}` for status line
-- `~/dotfiles/home/claude/statusline-command.sh` updated: `trakr spend --json` section with colour coding and `command -v trakr` guard
-- `~/.claude/settings.json` `statusLine` field added pointing to the script
-
-**State of the project:**
-- Claude Code status line live: shows spend/budget with colour (green/yellow/red) from `trakr spend --json`
-- 66 tests passing; `cargo build` clean; launchd service restarted
-- Hook-free architecture fully in effect: 30s reconciliation loop is the sole update mechanism
-
-**Immediate next priorities:**
-1. Action 4d.3 — `trakr list` with title + project; `trakr show` with title + summary
-2. Filtering/JSON output on `list`, `show`, `stats`
-3. README update to document `sync`, `inspect-logs` redesign, `repair` default, no-hooks architecture
-4. CI/CD and crates.io publication (Action 5.3)
-
-─────────────────────────────────────────────────────────────────────────────
 
 ## ── CHECKPOINT: Session 2026-06-14 (dynamic pricing + UX fixes) ────────────
 
@@ -525,6 +498,29 @@ Design doc: `doc/planning/otel-gap-fill-plan.md`
 **Immediate next priorities:**
 1. Phase D remaining — `trakr status`: warn if OTEL enabled but no batches received in >90 s
 2. Action 4d.3 — `trakr list` with title + project; `trakr show` with title + summary
+3. Action 5.4 — CodeQL setup (reference: `~/projects/tsk`)
+4. GitHub Actions CI/CD (Action 5.3)
+
+─────────────────────────────────────────────────────────────────────────────
+
+## ── CHECKPOINT: Session 2026-06-15 (OTEL enterprise investigation + UX tweaks) ──
+
+**What was completed this session:**
+- Diagnosed OTEL not working on enterprise CC: binary analysis revealed an early-return gate (`NP()`) that bypasses standard `OTEL_*` env vars entirely on enterprise accounts; workarounds (hijacking `BETA_TRACING_ENDPOINT`) inadvisable as it intercepts Anthropic's enterprise telemetry
+- Reverted OTEL-by-default in `trakr init`: config default back to `otel_enabled = false`; OTEL setup block removed from `cmd_init`; config comment added noting enterprise limitation
+- `doc/otel-enterprise-investigation.md` added: full binary analysis, two code paths, workarounds rejected, conclusion closed
+- `trakr init` now prints "Run `trakr restart-service` if the service is already running" hint
+- `get_monthly_background_spend_usd` returns `(f64, usize)` (cost + call count); Background line in `trakr spend` shows `$X.XX (N calls)` so it's visible when OTEL is capturing data
+- v0.1.7 / v0.1.8 / v0.1.9 bumped (in progress — user committing and publishing)
+
+**State of the project:**
+- 73 tests passing; `cargo build` clean; v0.1.9 ready to publish
+- OTEL is opt-in only (`trakr otel enable`); works on personal accounts, silently no-ops on enterprise — documented
+- Background call count visible in `trakr spend` when OTEL data is present
+
+**Immediate next priorities:**
+1. Action 4d.3 — `trakr list` with title + project; `trakr show` with title + summary
+2. Action 5.6 Phase D — `trakr status` warn if OTEL enabled but no batches received in >90 s
 3. Action 5.4 — CodeQL setup (reference: `~/projects/tsk`)
 4. GitHub Actions CI/CD (Action 5.3)
 
