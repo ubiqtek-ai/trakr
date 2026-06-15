@@ -800,6 +800,68 @@ pub fn get_total_spend_usd() -> Result<f64> {
     Ok(total)
 }
 
+#[derive(Debug, Default)]
+pub struct TokenTotals {
+    pub input: u64,
+    pub output: u64,
+    pub cache_creation: u64,
+    pub cache_read: u64,
+}
+
+/// Sum raw token counts from all `token_usage` events, optionally filtered to a `YYYY-MM` month.
+/// Month attribution matches `get_monthly_spend_usd`: a session belongs to the month of its last
+/// `token_usage` event.
+pub fn get_token_totals(year_month: Option<&str>) -> Result<TokenTotals> {
+    let conn = open_db()?;
+
+    let payloads: Vec<String> = match year_month {
+        Some(ym) => {
+            let mut stmt = conn.prepare(
+                "SELECT payload FROM events \
+                 WHERE event_type = 'token_usage' \
+                 AND session_id IN ( \
+                   SELECT session_id FROM events \
+                   WHERE event_type = 'token_usage' \
+                   GROUP BY session_id \
+                   HAVING strftime('%Y-%m', MAX(timestamp)) = ?1 \
+                 )",
+            )?;
+            let rows: Vec<String> = stmt
+                .query_map(params![ym], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        }
+        None => {
+            let mut stmt = conn
+                .prepare("SELECT payload FROM events WHERE event_type = 'token_usage'")?;
+            let rows: Vec<String> = stmt
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        }
+    };
+
+    let mut totals = TokenTotals::default();
+    for payload in payloads {
+        let Ok(event) = serde_json::from_str::<crate::event::Event>(&payload) else { continue };
+        if let crate::event::Event::TokenUsage {
+            input_tokens,
+            output_tokens,
+            cache_creation_input_tokens,
+            cache_read_input_tokens,
+            ..
+        } = event
+        {
+            totals.input           += input_tokens;
+            totals.output          += output_tokens;
+            totals.cache_creation  += cache_creation_input_tokens;
+            totals.cache_read      += cache_read_input_tokens;
+        }
+    }
+
+    Ok(totals)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

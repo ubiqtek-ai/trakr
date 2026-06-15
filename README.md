@@ -1,6 +1,6 @@
-# ctx-trakr
+# trakr
 
-A Rust CLI (binary name: `trakr`) that tracks Claude Code context usage and estimates spend across all your active sessions. Designed for multi-session tmux workflows where you want a single aggregated month-to-date cost view.
+A Rust CLI that tracks Claude Code context usage and estimates spend across all your active sessions. Designed for multi-session tmux workflows where you want a single aggregated month-to-date cost view.
 
 ## Features
 
@@ -45,14 +45,9 @@ Both install a binary named **`trakr`**.
 trakr init
 ```
 
-This does everything in one step:
+Creates `~/.trakr/` with the SQLite DB (`trakr.db`), `sessions/`, `transcripts/`, `archive/`, and `config.toml`. No hooks or env vars are written anywhere — tracking is purely transcript-driven.
 
-- Creates `~/.trakr/` with the SQLite DB (`trakr.db`), `sessions/`, `transcripts/`, `archive/`, and `config.toml`
-- Optionally writes OTEL telemetry env vars into `~/.claude/settings.json` (see [Optional: OTEL cross-check](#optional-otel-cross-check) below — these are **not** required for accurate spend tracking)
-
-Scoping any env vars to Claude Code's settings means no shell profile changes are needed.
-
-### 2. Start the server
+### 2. Start the service
 
 ```bash
 trakr install-service   # macOS LaunchAgent — starts now and on every login
@@ -60,7 +55,15 @@ trakr install-service   # macOS LaunchAgent — starts now and on every login
 trakr serve
 ```
 
-### 3. Verify
+On startup the daemon runs a reconciliation sweep that imports all existing Claude Code sessions from `~/.claude/projects/` automatically — no separate backfill step needed.
+
+### 3. Check spend
+
+```bash
+trakr spend
+```
+
+### 4. Verify pipeline health
 
 ```bash
 trakr status

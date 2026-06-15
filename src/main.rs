@@ -22,7 +22,7 @@ struct ReconcileStats {
 
 #[derive(Parser)]
 #[command(
-    name = "ctx-trakr",
+    name = "trakr",
     version,
     about = "Track Claude Code context usage and estimate spend across sessions"
 )]
@@ -94,6 +94,7 @@ enum Commands {
         dry_run: bool,
     },
     /// Show stats about Claude Code's native session logs (read-only diagnostic)
+    #[command(name = "inspect")]
     InspectLogs {
         /// Only show projects whose path contains this substring
         #[arg(long)]
@@ -912,6 +913,8 @@ fn cmd_inspect_logs(project: Option<&str>, since: Option<&str>, verbose: bool) -
     let year_month = Utc::now().format("%Y-%m").to_string();
     let (month_spend, _) = storage::get_monthly_spend_usd(&year_month).unwrap_or((0.0, 0));
     let month_label = chrono::Local::now().format("%B %Y").to_string();
+    let total_tokens = storage::get_token_totals(None).unwrap_or_default();
+    let month_tokens = storage::get_token_totals(Some(&year_month)).unwrap_or_default();
 
     // ── Summary block ─────────────────────────────────────────────────────────
 
@@ -938,6 +941,17 @@ fn cmd_inspect_logs(project: Option<&str>, since: Option<&str>, verbose: bool) -
     println!();
     println!("  {:<24} ${:.2}", "Spend (all time)", total_spend);
     println!("  {:<24} ${:.2}", format!("Spend ({})", month_label), month_spend);
+    println!();
+    println!("  {:<24} {:>8} in / {:>8} out / {:>8} cache",
+        "Tokens (all time)",
+        fmt_tokens_compact(total_tokens.input),
+        fmt_tokens_compact(total_tokens.output),
+        fmt_tokens_compact(total_tokens.cache_read + total_tokens.cache_creation));
+    println!("  {:<24} {:>8} in / {:>8} out / {:>8} cache",
+        format!("Tokens ({})", month_label),
+        fmt_tokens_compact(month_tokens.input),
+        fmt_tokens_compact(month_tokens.output),
+        fmt_tokens_compact(month_tokens.cache_read + month_tokens.cache_creation));
 
     // ── Verbose: per-session table ────────────────────────────────────────────
 
@@ -1374,9 +1388,15 @@ fn cmd_status() -> Result<()> {
         match newest_transcript_mtime {
             Some(tm) => {
                 let age_mins = Utc::now().signed_duration_since(tm).num_minutes();
-                println!("  {} {:<32} newest transcript {} min ago",
-                    ok(age_mins < 120), "DB freshness",
-                    age_mins);
+                let age_str = if age_mins < 60 {
+                    format!("{} min ago", age_mins)
+                } else if age_mins < 1440 {
+                    format!("{}h {}m ago", age_mins / 60, age_mins % 60)
+                } else {
+                    format!("{}d {}h ago", age_mins / 1440, (age_mins % 1440) / 60)
+                };
+                println!("  {} {:<32} newest transcript {}",
+                    ok(age_mins < 120), "DB freshness", age_str);
             }
             None => {
                 println!("  {} {:<32} no transcripts found", ok(false), "DB freshness");
@@ -1754,7 +1774,7 @@ fn cmd_logs(lines: usize) -> Result<()> {
     Ok(())
 }
 
-const LAUNCH_AGENT_LABEL: &str = "com.trakr.serve";
+const LAUNCH_AGENT_LABEL: &str = "io.ubiqtek.trakr.serve";
 
 fn launch_agent_plist_path() -> Result<std::path::PathBuf> {
     let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
@@ -1865,6 +1885,16 @@ fn cmd_archive() -> Result<()> {
     );
 
     Ok(())
+}
+
+fn fmt_tokens_compact(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
 }
 
 /// Format an integer with thousands separators.

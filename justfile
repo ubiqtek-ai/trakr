@@ -10,7 +10,7 @@ test:
 
 # Install locally (into ~/.cargo/bin)
 install-cli: build
-    cargo install --path .
+    cargo install --path . --force
 
 # Clean up test session data
 clean-data:
