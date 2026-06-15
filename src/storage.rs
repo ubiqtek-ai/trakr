@@ -313,8 +313,8 @@ pub fn get_monthly_adjustment_usd(year_month: &str) -> Result<f64> {
 
 /// Sum `cost_usd` from all `background_api_call` events in the given `YYYY-MM` month.
 ///
-/// Returns 0.0 if OTEL is not enabled or no data has arrived yet.
-pub fn get_monthly_background_spend_usd(year_month: &str) -> Result<f64> {
+/// Returns `(total_usd, call_count)`. Both are 0 if OTEL is not enabled or no data has arrived.
+pub fn get_monthly_background_spend_usd(year_month: &str) -> Result<(f64, usize)> {
     let conn = open_db()?;
     let mut stmt = conn.prepare(
         "SELECT payload FROM events \
@@ -326,13 +326,15 @@ pub fn get_monthly_background_spend_usd(year_month: &str) -> Result<f64> {
         .collect::<Result<Vec<_>, _>>()?;
 
     let mut total = 0.0f64;
+    let mut count = 0usize;
     for payload in payloads {
         let Ok(event) = serde_json::from_str::<Event>(&payload) else { continue };
         if let Event::BackgroundApiCall { cost_usd, .. } = event {
             total += cost_usd;
+            count += 1;
         }
     }
-    Ok(total)
+    Ok((total, count))
 }
 
 /// Query events from the unified DB.

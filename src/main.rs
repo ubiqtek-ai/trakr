@@ -1312,10 +1312,10 @@ fn cmd_spend(json: bool) -> Result<()> {
 
     storage::init_db()?;
 
-    let background = if cfg.otel_enabled {
-        storage::get_monthly_background_spend_usd(&year_month).unwrap_or(0.0)
+    let (background, bg_calls) = if cfg.otel_enabled {
+        storage::get_monthly_background_spend_usd(&year_month).unwrap_or((0.0, 0))
     } else {
-        0.0
+        (0.0, 0)
     };
 
     let adjustment = storage::get_monthly_adjustment_usd(&year_month).unwrap_or(0.0);
@@ -1377,7 +1377,7 @@ fn cmd_spend(json: bool) -> Result<()> {
         println!("  {:<width$} {}", "Transcripts", transcript_val, width = LW);
         if background > 0.0 {
             let background_val = format!("{:>width$}", format!("${:.2}", background), width = VW);
-            println!("  {:<width$} {}", "Background", background_val, width = LW);
+            println!("  {:<width$} {}  ({} calls)", "Background", background_val, bg_calls, width = LW);
         }
         if adjustment != 0.0 {
             let sign = if adjustment >= 0.0 { "+" } else { "" };

@@ -1,6 +1,6 @@
 [package]
 name = "trakr"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2021"
 description = "Track Claude Code session spend, tool use, and model usage from native session transcripts."
 homepage = "https://github.com/ubiqtek-ai/trakr"
