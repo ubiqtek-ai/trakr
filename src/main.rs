@@ -50,7 +50,11 @@ enum Commands {
         session_id: String,
     },
     /// Show aggregate stats across all sessions
-    Stats,
+    /// Show aggregate stats (add --verbose for the session list)
+    Stats {
+        #[arg(long, short = 'v')]
+        verbose: bool,
+    },
     /// Delete all recorded data (DB and JSONL files)
     Reset {
         /// Skip confirmation prompt
@@ -147,7 +151,7 @@ fn run(cli: Cli) -> Result<()> {
         Commands::List => cmd_list(),
         Commands::Migrate => cmd_migrate(),
         Commands::Show { session_id } => cmd_show(&session_id),
-        Commands::Stats => cmd_stats(),
+        Commands::Stats { verbose } => cmd_stats(verbose),
         Commands::Reset { yes } => cmd_reset(yes),
         Commands::Serve { api_port, otel_port } => cmd_serve(api_port, otel_port),
         Commands::Spend { json } => cmd_spend(json),
@@ -539,7 +543,7 @@ fn cmd_show(session_id: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_stats() -> Result<()> {
+fn cmd_stats(verbose: bool) -> Result<()> {
     use trakr::event::Event;
     use std::collections::HashMap;
 
@@ -549,32 +553,23 @@ fn cmd_stats() -> Result<()> {
     let total_sessions = sessions.len();
     let total_events = all_events.len();
 
-    // Aggregate stats.
+    // Per-model token accumulators: model → (input, output, cache_create, cache_read, events)
+    let mut model_tokens: HashMap<String, (u64, u64, u64, u64, u64)> = HashMap::new();
     let mut tool_counts: HashMap<String, u64> = HashMap::new();
-    let mut model_counts: HashMap<String, u64> = HashMap::new();
-    let mut input_tokens: u64 = 0;
-    let mut output_tokens: u64 = 0;
-    let mut cache_read: u64 = 0;
-    let mut cache_create: u64 = 0;
     let mut token_total: u64 = 0;
 
-    // Track first-seen timestamp per session.
+    // Track first-seen timestamp per session for verbose list.
     let mut session_first: HashMap<String, chrono::DateTime<chrono::Utc>> = HashMap::new();
 
     for (sid, ts, event) in &all_events {
         session_first
             .entry(sid.clone())
-            .and_modify(|existing| {
-                if ts < existing {
-                    *existing = *ts;
-                }
-            })
+            .and_modify(|existing| { if ts < existing { *existing = *ts; } })
             .or_insert(*ts);
 
         match event {
             Event::ToolUse { tool_name, .. } => {
-                let normalized = capitalize_first(tool_name);
-                *tool_counts.entry(normalized).or_insert(0) += 1;
+                *tool_counts.entry(capitalize_first(tool_name)).or_insert(0) += 1;
             }
             Event::TokenUsage {
                 model,
@@ -584,16 +579,22 @@ fn cmd_stats() -> Result<()> {
                 cache_read_input_tokens: cr,
                 total_tokens: tot,
             } => {
-                *model_counts.entry(model.clone()).or_insert(0) += 1;
-                input_tokens += inp;
-                output_tokens += out;
-                cache_read += cr;
-                cache_create += cc;
+                let e = model_tokens.entry(model.clone()).or_insert((0, 0, 0, 0, 0));
+                e.0 += inp;
+                e.1 += out;
+                e.2 += cc;
+                e.3 += cr;
+                e.4 += 1;
                 token_total += tot;
             }
             _ => {}
         }
     }
+
+    let input_tokens: u64  = model_tokens.values().map(|v| v.0).sum();
+    let output_tokens: u64 = model_tokens.values().map(|v| v.1).sum();
+    let cache_create: u64  = model_tokens.values().map(|v| v.2).sum();
+    let cache_read: u64    = model_tokens.values().map(|v| v.3).sum();
 
     println!("trakr stats");
     println!("{}", "=".repeat(39));
@@ -611,30 +612,39 @@ fn cmd_stats() -> Result<()> {
         }
     }
 
-    // Token usage.
+    // Token usage totals.
     if token_total > 0 {
         println!();
         println!("Token usage:");
-        println!("  Input:          {:>13}", fmt_num(input_tokens));
-        println!("  Output:         {:>13}", fmt_num(output_tokens));
-        println!("  Cache read:     {:>13}", fmt_num(cache_read));
-        println!("  Cache create:   {:>13}", fmt_num(cache_create));
-        println!("  Total:          {:>13}", fmt_num(token_total));
+        println!("  {:<14}  {:>13}", "Input",        fmt_num(input_tokens));
+        println!("  {:<14}  {:>13}", "Output",       fmt_num(output_tokens));
+        println!("  {:<14}  {:>13}", "Cache read",   fmt_num(cache_read));
+        println!("  {:<14}  {:>13}", "Cache create", fmt_num(cache_create));
+        println!("  {:<14}  {:>13}", "Total",        fmt_num(token_total));
     }
 
-    // Model distribution.
-    if !model_counts.is_empty() {
+    // Per-model breakdown.
+    if !model_tokens.is_empty() {
         println!();
-        println!("Models:");
-        let mut models: Vec<(String, u64)> = model_counts.into_iter().collect();
-        models.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-        for (model, count) in &models {
-            println!("  {:<30}  {}", model, count);
+        println!("Tokens by model:");
+        println!("  {:<32}  {:>10}  {:>10}  {:>12}  {:>12}",
+            "Model", "In", "Out", "Cache read", "Cache cre");
+        println!("  {}", "-".repeat(82));
+        let mut models: Vec<(String, (u64, u64, u64, u64, u64))> =
+            model_tokens.into_iter().collect();
+        models.sort_by(|a, b| (b.1.0 + b.1.1).cmp(&(a.1.0 + a.1.1)).then(a.0.cmp(&b.0)));
+        for (model, (inp, out, cc, cr, _)) in &models {
+            println!("  {:<32}  {:>10}  {:>10}  {:>12}  {:>12}",
+                model,
+                fmt_tokens_compact(*inp),
+                fmt_tokens_compact(*out),
+                fmt_tokens_compact(*cr),
+                fmt_tokens_compact(*cc));
         }
     }
 
-    // Session list.
-    if !sessions.is_empty() {
+    // Session list — verbose only.
+    if verbose && !sessions.is_empty() {
         println!();
         println!("Sessions:");
         for (sid, count) in &sessions {

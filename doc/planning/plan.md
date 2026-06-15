@@ -3,7 +3,7 @@
 ## ── WHAT'S NEXT ──────────────────────────────────────────────────────────
 **Next:** Action 4d.3 — surface `title` + `summary` in `trakr list` and `trakr show`
 **Sub-doc:** (none)
-**Blockers:** None
+**Blockers:** None — diagnosing spend accuracy on work machine first
 ─────────────────────────────────────────────────────────────────────────────
 
 ## Phase 1: Project Foundation
@@ -217,9 +217,13 @@ Key findings:
 - ✓ DONE - Troubleshooting guide (OTEL not connecting, DB missing, etc.) — README Troubleshooting section: OTEL never-received (new-session requirement, ~60 s export interval), http/json-only protocol, port clashes, low spend, stale binary
 
 ### Action 5.3: Crates.io publication
-- TODO - Final dependency audit
-- TODO - Version 0.1.0 release
+- ✓ DONE - Final dependency audit
+- ✓ DONE - Version 0.1.0 published to crates.io as `trakr` (package renamed from `ctx-trakr`)
+- ✓ DONE - Version 0.1.1 published (crate rename, launch agent label, `inspect` command, token totals, UX fixes)
 - TODO - GitHub Actions CI/CD setup
+
+### Action 5.4: CodeQL static analysis
+- TODO - Set up CodeQL on this repo (reference: `~/projects/tsk` already has it configured)
 
 ---
 
@@ -483,6 +487,32 @@ Key findings:
 2. Filtering/JSON output on `list`, `show`, `stats`
 3. README update to document `sync-rates`, `sync`, `inspect-logs` redesign, no-hooks architecture
 4. CI/CD and crates.io publication (Action 5.3)
+
+─────────────────────────────────────────────────────────────────────────────
+
+## ── CHECKPOINT: Session 2026-06-15 (publish + UX polish) ──────────────────
+
+**What was completed this session:**
+- Crate renamed `ctx-trakr` → `trakr`; GitHub repo renamed to `ubiqtek-ai/trakr`; all `ctx_trakr::` imports updated in `src/main.rs`
+- Published `trakr v0.1.0` then `v0.1.1` to crates.io
+- `Cargo.toml`: added `homepage`, `repository`, `keywords`, `categories`
+- README: title updated, Quick start rewritten (no hooks/OTEL, startup reconciliation handles backfill, `trakr inspect` added)
+- `LAUNCH_AGENT_LABEL` corrected to `io.ubiqtek.trakr.serve`
+- Clap `name = "ctx-trakr"` fixed to `"trakr"` (was showing wrong name in `--version`)
+- DB freshness in `trakr status` now shows human-readable age (`3h 42m ago` / `1d 5h ago`)
+- `trakr inspect`: token totals added to summary (all-time + monthly, K/M compact format)
+- `inspect-logs` subcommand renamed to `inspect`
+- `Justfile`: `install-cli` now passes `--force`
+
+**State of the project:**
+- 66 tests passing; `cargo build` clean; `trakr v0.1.1` live on crates.io
+- Diagnosing spend accuracy on work machine (installing fresh and comparing `trakr inspect` + `trakr spend` output)
+
+**Immediate next priorities:**
+1. Diagnose spend accuracy on work machine using `trakr inspect` token totals
+2. Action 4d.3 — `trakr list` with title + project; `trakr show` with title + summary
+3. Action 5.4 — CodeQL setup (reference: `~/projects/tsk`)
+4. GitHub Actions CI/CD (Action 5.3)
 
 ─────────────────────────────────────────────────────────────────────────────
 
