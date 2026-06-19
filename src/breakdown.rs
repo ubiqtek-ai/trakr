@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -170,17 +171,23 @@ fn extract_tool_calls(content: &serde_json::Value) -> Vec<ToolCall> {
         .collect()
 }
 
-/// Parse a Claude Code native JSONL transcript and return a per-category breakdown.
+/// Parse a Claude Code native JSONL transcript and return a per-category breakdown plus the
+/// date range (first timestamp, last timestamp) seen in the file.
 ///
 /// Deduplicates API turns by `message.id` (same logic as `PerModelAccumulator` in
 /// `backfill.rs`) so token totals match what `trakr stats` reports.
-pub fn compute_breakdown_from_transcript(path: &Path, card: &RateCard) -> Result<Vec<BreakdownRow>> {
+pub fn compute_breakdown_from_transcript(
+    path: &Path,
+    card: &RateCard,
+) -> Result<(Vec<BreakdownRow>, Option<(DateTime<Utc>, DateTime<Utc>)>)> {
     let contents = std::fs::read_to_string(path)
         .with_context(|| format!("reading transcript {}", path.display()))?;
 
     let mut ordered_ids: Vec<String> = Vec::new();
     let mut turns: HashMap<String, TurnEntry> = HashMap::new();
     let mut anon_counter: u64 = 0;
+    let mut first_ts: Option<DateTime<Utc>> = None;
+    let mut last_ts: Option<DateTime<Utc>> = None;
 
     for line in contents.lines() {
         let line = line.trim();
@@ -190,6 +197,22 @@ pub fn compute_breakdown_from_transcript(path: &Path, card: &RateCard) -> Result
         let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
+
+        // Track date range from any line with a timestamp field.
+        if let Some(ts) = obj
+            .get("timestamp")
+            .and_then(|v| v.as_str())
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.with_timezone(&Utc))
+        {
+            if first_ts.is_none() || ts < first_ts.unwrap() {
+                first_ts = Some(ts);
+            }
+            if last_ts.is_none() || ts > last_ts.unwrap() {
+                last_ts = Some(ts);
+            }
+        }
+
         if obj.get("type").and_then(|v| v.as_str()) != Some("assistant") {
             continue;
         }
@@ -295,7 +318,11 @@ pub fn compute_breakdown_from_transcript(path: &Path, card: &RateCard) -> Result
             .partial_cmp(&a.cost_usd)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    Ok(rows)
+    let date_range = match (first_ts, last_ts) {
+        (Some(f), Some(l)) => Some((f, l)),
+        _ => None,
+    };
+    Ok((rows, date_range))
 }
 
 /// Merge a slice of row lists into a single aggregated list, sorted by cost descending.

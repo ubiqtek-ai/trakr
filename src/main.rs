@@ -1977,13 +1977,21 @@ fn cmd_breakdown(session: Option<&str>, month: Option<&str>) -> Result<()> {
 
     let card = rates::load_rate_card();
 
+    let mut global_first: Option<chrono::DateTime<Utc>> = None;
+    let mut global_last: Option<chrono::DateTime<Utc>> = None;
+
     let rows = if let Some(sid) = session {
         // Single session.
         let path = transcripts_dir.join(format!("{}.jsonl", sid));
         if !path.exists() {
             anyhow::bail!("No transcript found for session {}.", sid);
         }
-        breakdown::compute_breakdown_from_transcript(&path, &card)?
+        let (rows, range) = breakdown::compute_breakdown_from_transcript(&path, &card)?;
+        if let Some((f, l)) = range {
+            global_first = Some(f);
+            global_last = Some(l);
+        }
+        rows
     } else {
         // All sessions, optionally filtered by month.
         let session_ids: Option<std::collections::HashSet<String>> = if let Some(ym) = month {
@@ -1997,11 +2005,7 @@ fn cmd_breakdown(session: Option<&str>, month: Option<&str>) -> Result<()> {
         let mut entries: Vec<std::fs::DirEntry> = std::fs::read_dir(&transcripts_dir)
             .context("reading transcripts directory")?
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.path()
-                    .extension()
-                    .map_or(false, |ext| ext == "jsonl")
-            })
+            .filter(|e| e.path().extension().map_or(false, |ext| ext == "jsonl"))
             .collect();
         entries.sort_by_key(|e| e.file_name());
 
@@ -2021,7 +2025,15 @@ fn cmd_breakdown(session: Option<&str>, month: Option<&str>) -> Result<()> {
             }
 
             match breakdown::compute_breakdown_from_transcript(&path, &card) {
-                Ok(rows) => {
+                Ok((rows, range)) => {
+                    if let Some((f, l)) = range {
+                        if global_first.is_none() || f < global_first.unwrap() {
+                            global_first = Some(f);
+                        }
+                        if global_last.is_none() || l > global_last.unwrap() {
+                            global_last = Some(l);
+                        }
+                    }
                     all_rows.push(rows);
                     n_processed += 1;
                 }
@@ -2057,43 +2069,52 @@ fn cmd_breakdown(session: Option<&str>, month: Option<&str>) -> Result<()> {
 
     let total_cost: f64 = rows.iter().map(|r| r.cost_usd).sum();
     let total_turns: u64 = rows.iter().map(|r| r.turns).sum();
+    let total_tokens: u64 = rows.iter().map(|r| {
+        r.input_tokens + r.output_tokens + r.cache_creation_tokens + r.cache_read_tokens
+    }).sum();
 
-    let header = match (session, month) {
-        (Some(sid), _) => format!("trakr breakdown — session {}", &sid[..sid.len().min(12)]),
-        (None, Some(ym)) => format!("trakr breakdown — {}", ym),
-        (None, None) => "trakr breakdown — all sessions".to_string(),
+    let date_label = match (global_first, global_last) {
+        (Some(f), Some(l)) => {
+            let fd = f.format("%Y-%m-%d").to_string();
+            let ld = l.format("%Y-%m-%d").to_string();
+            if fd == ld { fd } else { format!("{} → {}", fd, ld) }
+        }
+        _ => "unknown range".to_string(),
+    };
+
+    let header = match session {
+        Some(sid) => format!("trakr breakdown — session {}", &sid[..sid.len().min(12)]),
+        None => format!("trakr breakdown — {}", date_label),
     };
     println!("{}", header);
     println!("{}", "=".repeat(header.len().max(60)));
     println!();
     println!(
-        "  {:<14}  {:>6}  {:>9}  {:>9}  {:>11}  {:>9}  {:>6}",
-        "Category", "Turns", "Input", "Output", "Cache read", "Cost", "Share"
+        "  {:<14}  {:>6}  {:>9}  {:>9}  {:>11}  {:>9}  {:>9}  {:>6}",
+        "Category", "Turns", "Input", "Output", "Cache read", "Total", "Cost", "Share"
     );
-    println!("  {}", "-".repeat(71));
+    println!("  {}", "-".repeat(87));
 
     for row in &rows {
-        let share = if total_cost > 0.0 {
-            row.cost_usd / total_cost * 100.0
-        } else {
-            0.0
-        };
+        let share = if total_cost > 0.0 { row.cost_usd / total_cost * 100.0 } else { 0.0 };
+        let row_total = row.input_tokens + row.output_tokens + row.cache_creation_tokens + row.cache_read_tokens;
         println!(
-            "  {:<14}  {:>6}  {:>9}  {:>9}  {:>11}  {:>9}  {:>5.1}%",
+            "  {:<14}  {:>6}  {:>9}  {:>9}  {:>11}  {:>9}  {:>9}  {:>5.1}%",
             row.category.label(),
             row.turns,
             fmt_tokens_compact(row.input_tokens),
             fmt_tokens_compact(row.output_tokens),
             fmt_tokens_compact(row.cache_read_tokens),
+            fmt_tokens_compact(row_total),
             format!("${:.2}", row.cost_usd),
             share,
         );
     }
 
-    println!("  {}", "-".repeat(71));
+    println!("  {}", "-".repeat(87));
     println!(
-        "  {:<14}  {:>6}  {:>47}  {:>5.1}%",
-        "Total", total_turns, format!("${:.2}", total_cost), 100.0
+        "  {:<14}  {:>6}  {:>44}  {:>9}  {:>5.1}%",
+        "Total", total_turns, fmt_tokens_compact(total_tokens), format!("${:.2}", total_cost), 100.0
     );
     println!();
 
