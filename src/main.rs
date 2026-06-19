@@ -2051,6 +2051,8 @@ fn cmd_breakdown(session: Option<&str>, month: Option<&str>, all: bool) -> Resul
 
     let mut global_first: Option<chrono::DateTime<Utc>> = None;
     let mut global_last: Option<chrono::DateTime<Utc>> = None;
+    let mut processed_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut footer_month: Option<String> = None;
 
     let rows = if let Some(sid) = session {
         // Single session.
@@ -2074,6 +2076,7 @@ fn cmd_breakdown(session: Option<&str>, month: Option<&str>, all: bool) -> Resul
         } else {
             Some(month.map(|s| s.to_string()).unwrap_or_else(|| Utc::now().format("%Y-%m").to_string()))
         };
+        footer_month = effective_month.clone();
         let session_ids: Option<std::collections::HashSet<String>> = if let Some(ref ym) = effective_month {
             storage::init_db()?;
             let ids = storage::get_session_ids_for_month(ym)?;
@@ -2119,6 +2122,7 @@ fn cmd_breakdown(session: Option<&str>, month: Option<&str>, all: bool) -> Resul
                         }
                     }
                     all_rows.push(rows);
+                    processed_ids.insert(sid.clone());
                     n_processed += 1;
                 }
                 Err(e) => {
@@ -2201,6 +2205,87 @@ fn cmd_breakdown(session: Option<&str>, month: Option<&str>, all: bool) -> Resul
         "Total", total_turns, fmt_tokens_compact(total_tokens), format!("${:.2}", total_cost), 100.0
     );
     println!();
+
+    // Reconciliation footer — monthly only (skipped for single session and --all).
+    if session.is_none() {
+        if let Some(ref ym) = footer_month {
+            use trakr::config;
+            let cfg = config::load_config().unwrap_or_default();
+
+            let db_transcripts = storage::get_monthly_spend_usd(ym)
+                .map(|(usd, _)| usd)
+                .unwrap_or(0.0);
+
+            // Resolve background using same priority as cmd_spend:
+            // OTEL data (if enabled + non-zero) → factor estimate → zero.
+            let (background_usd, bg_note) = {
+                let (otel_usd, otel_calls) = if cfg.otel_enabled {
+                    storage::get_monthly_background_spend_usd(ym).unwrap_or((0.0, 0))
+                } else {
+                    (0.0, 0)
+                };
+                if otel_calls > 0 {
+                    (otel_usd, format!("({} background API calls)", otel_calls))
+                } else if cfg.background_factor > 0.0 {
+                    (db_transcripts * cfg.background_factor,
+                     format!("(est. {:.0}%)", cfg.background_factor * 100.0))
+                } else {
+                    (0.0, String::new())
+                }
+            };
+
+            let adjustment_usd = storage::get_monthly_adjustment_usd(ym).unwrap_or(0.0);
+            let spend_total = db_transcripts + background_usd + adjustment_usd;
+            let db_gap = db_transcripts - total_cost;
+
+            // Identify sessions in the DB that had no transcript file.
+            let (missing_count, missing_cost) = if db_gap > 0.005 {
+                let db_ids: std::collections::HashSet<String> = storage::get_session_ids_for_month(ym)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect();
+                let missing_ids: Vec<String> = db_ids
+                    .iter()
+                    .filter(|id| !processed_ids.contains(*id))
+                    .cloned()
+                    .collect();
+                if missing_ids.is_empty() {
+                    (0usize, db_gap)
+                } else {
+                    let spend_map = storage::get_spend_by_session().unwrap_or_default();
+                    let cost: f64 = missing_ids.iter().filter_map(|id| spend_map.get(id)).sum();
+                    (missing_ids.len(), cost)
+                }
+            } else {
+                (0, 0.0)
+            };
+
+            const LW: usize = 24;
+            const VW: usize = 9;
+            let sep = "─".repeat(LW + VW + 6);
+            println!("  Reconciliation — {} vs trakr spend", ym);
+            println!("  {}", sep);
+            println!("  {:<LW$}  {:>VW$}", "Breakdown (this table)", format!("${:.2}", total_cost));
+            if missing_cost > 0.005 {
+                let note = if missing_count > 0 {
+                    format!("({} session{} with no transcript file)", missing_count, if missing_count == 1 { "" } else { "s" })
+                } else {
+                    String::new()
+                };
+                println!("  {:<LW$}  {:>VW$}  {}", "+ DB gap", format!("${:.2}", missing_cost), note);
+            }
+            if background_usd > 0.005 {
+                println!("  {:<LW$}  {:>VW$}  {}", "+ Background", format!("${:.2}", background_usd), bg_note);
+            }
+            if adjustment_usd.abs() > 0.005 {
+                let sign = if adjustment_usd >= 0.0 { "+" } else { "" };
+                println!("  {:<LW$}  {:>VW$}  (manual adjustment)", "+ Adjustment", format!("{}{:.2}", sign, adjustment_usd));
+            }
+            println!("  {}", sep);
+            println!("  {:<LW$}  {:>VW$}", "trakr spend total", format!("${:.2}", spend_total));
+            println!();
+        }
+    }
 
     Ok(())
 }

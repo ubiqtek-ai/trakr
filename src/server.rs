@@ -28,6 +28,8 @@ struct SpendResponse {
 #[derive(Serialize)]
 struct SpendSources {
     sessions_usd: f64,
+    background_usd: f64,
+    adjustment_usd: f64,
     sessions_count: usize,
 }
 
@@ -86,12 +88,20 @@ async fn handle_spend_monthly(
             )
         })?;
 
+    let (background_usd, _) = storage::get_monthly_background_spend_usd(&year_month)
+        .unwrap_or((0.0, 0));
+    let adjustment_usd = storage::get_monthly_adjustment_usd(&year_month)
+        .unwrap_or(0.0);
+    let total_usd = sessions_usd + background_usd + adjustment_usd;
+
     Ok(Json(SpendResponse {
         period: year_month,
-        spent_estimated_usd: round2(sessions_usd),
+        spent_estimated_usd: round2(total_usd),
         budget_usd: state.budget_usd,
         sources: SpendSources {
             sessions_usd: round2(sessions_usd),
+            background_usd: round2(background_usd),
+            adjustment_usd: round2(adjustment_usd),
             sessions_count,
         },
         note: "Costs are estimates based on the published Anthropic rate card.",

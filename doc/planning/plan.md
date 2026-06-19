@@ -196,17 +196,30 @@ Key findings:
 
 ### Action 4f.1: `trakr breakdown` command
 - ✓ DONE - `src/breakdown.rs` — per-category token breakdown from archived transcripts
-  - `ToolCategory` enum: CodeRead, CodeWrite, Execution, WebResearch, Delegation, Response, Other
-  - `categorise_tool(name)` + `categorise_turn(tools)` — priority-based classification
-  - `compute_breakdown_from_transcript(path, card)` — deduplicates by `message.id` (same logic as PerModelAccumulator); groups tool names per turn; computes cost per category
+  - `ToolCategory` enum: CodeRead, CodeWrite, CodeSearch, Execution, WebResearch, Delegation, Response, Other
+  - `ToolCall { name, bash_command }` — carries actual bash command text for Bash/Execute calls
+  - `categorise_bash_command(cmd)` — inspects leading binary: grep/rg/ag/find/fd/cat/bat/head/tail/wc/diff/ls/tree/eza/exa → CodeSearch; everything else → Execution
+  - `categorise_call(call)` + `categorise_turn(calls)` — priority-based classification (WebResearch < Delegation < CodeWrite < Execution < CodeSearch < CodeRead < Other < Response)
+  - `compute_breakdown_from_files(paths, card)` — concatenates main transcript + subagent files; deduplicates by `message.id`; tracks first/last timestamp from any JSONL line with `timestamp` field
+  - `compute_breakdown_from_transcript(path, card)` — thin wrapper around `compute_breakdown_from_files`
   - `merge_rows(all)` — aggregate across multiple sessions
-  - 6 unit tests (categorisation rules + merge correctness); 81 tests total
-- ✓ DONE - `storage::get_session_ids_for_month(year_month)` — queries sessions WHERE started_at LIKE 'YYYY-MM%'
-- ✓ DONE - `trakr breakdown [--session <id>] [--month YYYY-MM]` CLI command
-  - No args: aggregates all transcripts in `~/.trakr/transcripts/`
+  - 12 unit tests (categorisation rules + merge correctness); 81 tests total
+- ✓ DONE - `storage::get_session_ids_for_month(year_month)` — uses `MAX(token_usage timestamp)` approach (not `started_at`, which is unreliable for backfilled sessions):
+  ```sql
+  SELECT session_id FROM events WHERE event_type = 'token_usage'
+  GROUP BY session_id HAVING strftime('%Y-%m', MAX(timestamp)) = ?1
+  ```
+- ✓ DONE - `storage::get_all_time_spend_usd()` — sums all token_usage events across all sessions/months
+- ✓ DONE - `trakr spend --all` — all-time total (both transcripts and cost adjustments); defaults to current month
+- ✓ DONE - `trakr breakdown [--session <id>] [--month YYYY-MM] [--all]` CLI command
+  - Default: current month (matches `trakr spend` behaviour)
+  - `--all`: all sessions regardless of date
   - `--month`: filters via DB session IDs then loads matching transcripts
   - `--session`: single transcript
-  - Output: table with Turns, Input, Output, Cache read, Cost, Share columns
+  - Scans `~/.trakr/archive/<slug>/<uuid>/subagents/agent-*.jsonl` and includes subagent files alongside main transcript
+  - Output: table with Turns, Input, Output, Cache read, Total tokens, Cost, Share columns
+  - Header shows actual date range: `trakr breakdown — YYYY-MM-DD → YYYY-MM-DD`
+- ✓ DONE - v0.1.10 → v0.1.13 version bumps
 
 ## Phase 4e: Dynamic Pricing via LiteLLM
 
@@ -542,7 +555,7 @@ Design doc: `doc/planning/otel-gap-fill-plan.md`
 
 ─────────────────────────────────────────────────────────────────────────────
 
-## ── CHECKPOINT: Session 2026-06-19 (trakr breakdown) ──────────────────────────
+## ── CHECKPOINT: Session 2026-06-19 (trakr breakdown initial) ──────────────────
 
 **What was completed this session:**
 - `trakr breakdown` command implemented: classifies every API turn by the tools called and attributes token cost to one of 7 categories (CodeRead, CodeWrite, Execution, WebResearch, Delegation, Response, Other)
@@ -553,6 +566,31 @@ Design doc: `doc/planning/otel-gap-fill-plan.md`
 
 **State of the project:**
 - 81 tests passing; `cargo build` clean; `trakr breakdown` ready to use
+
+**Immediate next priorities:**
+1. Action 4d.3 — `trakr list` with title + project; `trakr show` with title + summary
+2. Action 5.4 — CodeQL setup (reference: `~/projects/tsk`)
+3. GitHub Actions CI/CD (Action 5.3)
+
+─────────────────────────────────────────────────────────────────────────────
+
+## ── CHECKPOINT: Session 2026-06-19 (breakdown refinements + --all flag) ────────
+
+**What was completed this session:**
+- `Bash` categorisation split: introduced `CodeSearch` category; `categorise_bash_command` inspects leading binary (grep/find/cat/etc → CodeSearch, everything else → Execution)
+- `ToolCall` struct carries `bash_command: Option<String>` extracted from `input.command` in tool_use blocks
+- Subagent JSONL files included: scans `~/.trakr/archive/<slug>/<uuid>/subagents/agent-*.jsonl` and feeds them into `compute_breakdown_from_files` alongside the main transcript — closed a ~$17 gap vs `trakr spend`
+- `storage::get_session_ids_for_month` fixed: switched from `started_at` (unreliable for backfilled sessions — was set to backfill run time) to `MAX(token_usage timestamp)`; correct month filter now matches `trakr spend`
+- Date range header: header shows `trakr breakdown — YYYY-MM-DD → YYYY-MM-DD` using actual first/last `timestamp` fields from JSONL lines
+- Total tokens column added before Cost column
+- `--all` flag added to both `trakr spend` and `trakr breakdown`; both default to current month without the flag
+- `storage::get_all_time_spend_usd()` added for `trakr spend --all`
+- v0.1.10 → v0.1.13 version bumps
+
+**State of the project:**
+- 81 tests passing; `cargo build` clean; v0.1.13 ready to push/publish
+- `trakr breakdown` total matches `trakr spend` within ~$2 (rounding); subagent gap closed
+- June 2026 home machine breakdown: CodeWrite 36.3% ($121), Response 17.7% ($59), CodeRead 15.7% ($53), Execution 11.9% ($40), CodeSearch 11.8% ($39)
 
 **Immediate next priorities:**
 1. Action 4d.3 — `trakr list` with title + project; `trakr show` with title + summary
