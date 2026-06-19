@@ -79,6 +79,9 @@ enum Commands {
         /// Output compact JSON instead of the human-readable table (no reconciliation)
         #[arg(long)]
         json: bool,
+        /// Show all-time spend across all months instead of just this month
+        #[arg(long)]
+        all: bool,
     },
     /// Check the health of the full tracking pipeline (settings, hooks, OTEL, server, DB)
     Status,
@@ -158,9 +161,12 @@ enum Commands {
         /// Show breakdown for a single session only
         #[arg(long, short = 's')]
         session: Option<String>,
-        /// Filter to a specific month (YYYY-MM); ignored when --session is given
+        /// Filter to a specific month (YYYY-MM); defaults to current month
         #[arg(long, short = 'm')]
         month: Option<String>,
+        /// Show all-time breakdown across all sessions instead of just this month
+        #[arg(long)]
+        all: bool,
     },
 }
 
@@ -191,7 +197,7 @@ fn run(cli: Cli) -> Result<()> {
         Commands::Stats { verbose, month } => cmd_stats(verbose, month.as_deref()),
         Commands::Reset { yes } => cmd_reset(yes),
         Commands::Serve { api_port, otel_port } => cmd_serve(api_port, otel_port),
-        Commands::Spend { json } => cmd_spend(json),
+        Commands::Spend { json, all } => cmd_spend(json, all),
         Commands::Status => cmd_status(),
         Commands::BackfillLogs { project, since, dry_run } => {
             cmd_backfill_logs(project.as_deref(), since.as_deref(), dry_run)
@@ -213,7 +219,7 @@ fn run(cli: Cli) -> Result<()> {
             OtelAction::Disable => cmd_otel_disable(),
         },
         Commands::Adjust { day, amount, reason } => cmd_adjust(&day, amount, reason),
-        Commands::Breakdown { session, month } => cmd_breakdown(session.as_deref(), month.as_deref()),
+        Commands::Breakdown { session, month, all } => cmd_breakdown(session.as_deref(), month.as_deref(), all),
     }
 }
 
@@ -1301,11 +1307,44 @@ fn cmd_serve(api_port_override: Option<u16>, otel_port_override: Option<u16>) ->
     Ok(())
 }
 
-fn cmd_spend(json: bool) -> Result<()> {
+fn cmd_spend(json: bool, all: bool) -> Result<()> {
     use trakr::config;
 
     let cfg = config::load_config()?;
     let year_month = Utc::now().format("%Y-%m").to_string();
+
+    if all {
+        storage::init_db()?;
+        let (spent, count) = storage::get_all_time_spend_usd()?;
+        let adjustment: f64 = {
+            // Sum adjustments across all months by querying without a month filter.
+            let conn = rusqlite::Connection::open(
+                dirs::home_dir().unwrap_or_default().join(".trakr").join("trakr.db")
+            )?;
+            conn.query_row(
+                "SELECT COALESCE(SUM(json_extract(payload,'$.amount_usd')),0) FROM events WHERE event_type='cost_adjustment'",
+                [],
+                |row| row.get::<_, f64>(0),
+            ).unwrap_or(0.0)
+        };
+        let total = spent + adjustment;
+        if json {
+            println!(r#"{{"scope":"all","spent_usd":{spent:.2},"adjustment_usd":{adjustment:.2},"total_usd":{total:.2},"sessions":{count}}}"#,
+                spent=spent, adjustment=adjustment, total=total, count=count);
+        } else {
+            const LW: usize = 12; const VW: usize = 10; const W: usize = 2 + LW + 1 + VW;
+            println!("Spend all time ({} sessions)", count);
+            println!("{}", "-".repeat(W));
+            println!("  {:<LW$}  {:>VW$}", "Transcripts", format!("${:.2}", spent));
+            if adjustment != 0.0 {
+                let sign = if adjustment >= 0.0 { "+" } else { "" };
+                println!("  {:<LW$}  {:>VW$}", "Adjustment", format!("{}{:.2}", sign, adjustment));
+            }
+            println!("  {:<LW$}  {:>VW$}", "Total", format!("${:.2}", total));
+            println!("{}", "-".repeat(W));
+        }
+        return Ok(());
+    }
 
     storage::init_db()?;
 
@@ -1962,7 +2001,7 @@ fn cmd_adjust(day: &str, amount: f64, reason: Option<String>) -> Result<()> {
 
 // ── Activity breakdown ────────────────────────────────────────────────────────
 
-fn cmd_breakdown(session: Option<&str>, month: Option<&str>) -> Result<()> {
+fn cmd_breakdown(session: Option<&str>, month: Option<&str>, all: bool) -> Result<()> {
     use trakr::rates;
 
     let home = dirs::home_dir()
@@ -1977,24 +2016,65 @@ fn cmd_breakdown(session: Option<&str>, month: Option<&str>) -> Result<()> {
 
     let card = rates::load_rate_card();
 
+    // Build UUID → subagent file paths map from the archive directory.
+    // Archive layout: ~/.trakr/archive/<slug>/<uuid>/subagents/agent-*.jsonl
+    let archive_dir = home.join(".trakr").join("archive");
+    let subagent_map: std::collections::HashMap<String, Vec<std::path::PathBuf>> = {
+        let mut map: std::collections::HashMap<String, Vec<std::path::PathBuf>> = std::collections::HashMap::new();
+        if archive_dir.exists() {
+            if let Ok(slugs) = std::fs::read_dir(&archive_dir) {
+                for slug in slugs.filter_map(|e| e.ok()) {
+                    if !slug.path().is_dir() { continue; }
+                    if let Ok(entries) = std::fs::read_dir(slug.path()) {
+                        for uuid_entry in entries.filter_map(|e| e.ok()) {
+                            let uuid_dir = uuid_entry.path();
+                            if !uuid_dir.is_dir() { continue; }
+                            let subagents_dir = uuid_dir.join("subagents");
+                            if !subagents_dir.is_dir() { continue; }
+                            let uuid = uuid_dir.file_name()
+                                .and_then(|n| n.to_str()).unwrap_or("").to_string();
+                            if let Ok(agents) = std::fs::read_dir(&subagents_dir) {
+                                let files: Vec<_> = agents.filter_map(|e| e.ok()).map(|e| e.path())
+                                    .filter(|p| p.extension().map_or(false, |ext| ext == "jsonl"))
+                                    .collect();
+                                if !files.is_empty() {
+                                    map.entry(uuid).or_default().extend(files);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        map
+    };
+
     let mut global_first: Option<chrono::DateTime<Utc>> = None;
     let mut global_last: Option<chrono::DateTime<Utc>> = None;
 
     let rows = if let Some(sid) = session {
         // Single session.
-        let path = transcripts_dir.join(format!("{}.jsonl", sid));
-        if !path.exists() {
+        let main_path = transcripts_dir.join(format!("{}.jsonl", sid));
+        if !main_path.exists() {
             anyhow::bail!("No transcript found for session {}.", sid);
         }
-        let (rows, range) = breakdown::compute_breakdown_from_transcript(&path, &card)?;
+        let subagent_paths = subagent_map.get(sid).cloned().unwrap_or_default();
+        let mut paths: Vec<&std::path::Path> = vec![main_path.as_path()];
+        for p in &subagent_paths { paths.push(p.as_path()); }
+        let (rows, range) = breakdown::compute_breakdown_from_files(&paths, &card)?;
         if let Some((f, l)) = range {
             global_first = Some(f);
             global_last = Some(l);
         }
         rows
     } else {
-        // All sessions, optionally filtered by month.
-        let session_ids: Option<std::collections::HashSet<String>> = if let Some(ym) = month {
+        // All sessions, filtered by month (defaults to current month unless --all).
+        let effective_month: Option<String> = if all {
+            None
+        } else {
+            Some(month.map(|s| s.to_string()).unwrap_or_else(|| Utc::now().format("%Y-%m").to_string()))
+        };
+        let session_ids: Option<std::collections::HashSet<String>> = if let Some(ref ym) = effective_month {
             storage::init_db()?;
             let ids = storage::get_session_ids_for_month(ym)?;
             Some(ids.into_iter().collect())
@@ -2024,7 +2104,11 @@ fn cmd_breakdown(session: Option<&str>, month: Option<&str>) -> Result<()> {
                 }
             }
 
-            match breakdown::compute_breakdown_from_transcript(&path, &card) {
+            let subagent_paths = subagent_map.get(&sid).cloned().unwrap_or_default();
+            let mut paths: Vec<&std::path::Path> = vec![path.as_path()];
+            for p in &subagent_paths { paths.push(p.as_path()); }
+
+            match breakdown::compute_breakdown_from_files(&paths, &card) {
                 Ok((rows, range)) => {
                     if let Some((f, l)) = range {
                         if global_first.is_none() || f < global_first.unwrap() {
@@ -2045,7 +2129,7 @@ fn cmd_breakdown(session: Option<&str>, month: Option<&str>) -> Result<()> {
         }
 
         if n_processed == 0 {
-            if let Some(ym) = month {
+            if let Some(ref ym) = effective_month {
                 println!("No transcripts found for {}.", ym);
             } else {
                 println!("No transcripts found.");

@@ -413,6 +413,64 @@ pub fn get_completed_session_ids() -> Result<std::collections::HashSet<String>> 
     Ok(ids)
 }
 
+/// Compute the total estimated spend in USD across all sessions regardless of month.
+///
+/// Returns `(total_usd, session_count)`.
+pub fn get_all_time_spend_usd() -> Result<(f64, usize)> {
+    use crate::cost::compute_cost_usd_with_card;
+    use crate::rates;
+    let card = rates::load_rate_card();
+    let conn = open_db()?;
+
+    let session_ids: Vec<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT session_id FROM events WHERE event_type = 'token_usage'",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()
+            .context("reading all session ids")?;
+        rows
+    };
+
+    let count = session_ids.len();
+    let mut total_usd = 0.0;
+
+    for session_id in &session_ids {
+        let mut stmt = conn.prepare(
+            "SELECT payload FROM events WHERE session_id = ?1 AND event_type = 'token_usage'",
+        )?;
+        let payloads: Vec<String> = stmt
+            .query_map(params![session_id], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()
+            .context("reading token_usage payloads")?;
+
+        for payload in payloads {
+            let Ok(event) = serde_json::from_str::<crate::event::Event>(&payload) else { continue };
+            if let crate::event::Event::TokenUsage {
+                model,
+                input_tokens,
+                output_tokens,
+                cache_creation_input_tokens,
+                cache_read_input_tokens,
+                cache_creation_1h_input_tokens,
+                ..
+            } = event {
+                total_usd += compute_cost_usd_with_card(
+                    &model,
+                    input_tokens,
+                    output_tokens,
+                    cache_creation_input_tokens,
+                    cache_read_input_tokens,
+                    cache_creation_1h_input_tokens,
+                    &card,
+                );
+            }
+        }
+    }
+
+    Ok((total_usd, count))
+}
+
 /// Compute the total estimated spend in USD for sessions attributed to the given year-month.
 ///
 /// A session is attributed to a month by the timestamp of its **last** `token_usage` event.
@@ -774,19 +832,22 @@ pub fn get_all_session_records() -> Result<Vec<SessionRecord>> {
     Ok(rows)
 }
 
-/// Return all session IDs whose `started_at` falls within the given month (YYYY-MM).
+/// Return all session IDs whose last `token_usage` event falls within the given month (YYYY-MM).
 ///
-/// Sessions with no `started_at` are excluded.
+/// Uses the same attribution logic as `get_monthly_spend_usd` so that `trakr breakdown --month`
+/// and `trakr spend` cover identical session sets.
 pub fn get_session_ids_for_month(year_month: &str) -> Result<Vec<String>> {
     let conn = open_db()?;
-    let prefix = format!("{}%", year_month);
     let mut stmt = conn
         .prepare(
-            "SELECT session_id FROM sessions WHERE started_at LIKE ?1 ORDER BY started_at ASC",
+            "SELECT session_id FROM events \
+             WHERE event_type = 'token_usage' \
+             GROUP BY session_id \
+             HAVING strftime('%Y-%m', MAX(timestamp)) = ?1",
         )
         .context("preparing month session query")?;
     let rows = stmt
-        .query_map(rusqlite::params![prefix], |row| row.get::<_, String>(0))
+        .query_map(rusqlite::params![year_month], |row| row.get::<_, String>(0))
         .context("querying sessions by month")?
         .collect::<Result<Vec<_>, _>>()
         .context("reading session id rows")?;

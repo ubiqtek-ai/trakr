@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::path::Path;
@@ -171,17 +171,32 @@ fn extract_tool_calls(content: &serde_json::Value) -> Vec<ToolCall> {
         .collect()
 }
 
-/// Parse a Claude Code native JSONL transcript and return a per-category breakdown plus the
-/// date range (first timestamp, last timestamp) seen in the file.
+/// Parse one or more Claude Code JSONL files (main transcript + any subagent files) and return
+/// a per-category breakdown plus the date range (first timestamp, last timestamp) seen.
 ///
-/// Deduplicates API turns by `message.id` (same logic as `PerModelAccumulator` in
-/// `backfill.rs`) so token totals match what `trakr stats` reports.
+/// Passing multiple files is equivalent to treating them as a single session — deduplication
+/// by `message.id` handles any cross-file collisions.  Deduplication logic matches
+/// `PerModelAccumulator` in `backfill.rs` so token totals align with `trakr spend`.
 pub fn compute_breakdown_from_transcript(
     path: &Path,
     card: &RateCard,
 ) -> Result<(Vec<BreakdownRow>, Option<(DateTime<Utc>, DateTime<Utc>)>)> {
-    let contents = std::fs::read_to_string(path)
-        .with_context(|| format!("reading transcript {}", path.display()))?;
+    compute_breakdown_from_files(&[path], card)
+}
+
+/// Like `compute_breakdown_from_transcript` but accepts multiple JSONL paths.
+pub fn compute_breakdown_from_files(
+    paths: &[&Path],
+    card: &RateCard,
+) -> Result<(Vec<BreakdownRow>, Option<(DateTime<Utc>, DateTime<Utc>)>)> {
+    let mut all_contents = String::new();
+    for path in paths {
+        match std::fs::read_to_string(path) {
+            Ok(c) => all_contents.push_str(&c),
+            Err(e) => eprintln!("Warning: could not read {}: {}", path.display(), e),
+        }
+    }
+    let contents = all_contents;
 
     let mut ordered_ids: Vec<String> = Vec::new();
     let mut turns: HashMap<String, TurnEntry> = HashMap::new();
