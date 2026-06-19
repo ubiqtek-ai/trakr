@@ -774,6 +774,25 @@ pub fn get_all_session_records() -> Result<Vec<SessionRecord>> {
     Ok(rows)
 }
 
+/// Return all session IDs whose `started_at` falls within the given month (YYYY-MM).
+///
+/// Sessions with no `started_at` are excluded.
+pub fn get_session_ids_for_month(year_month: &str) -> Result<Vec<String>> {
+    let conn = open_db()?;
+    let prefix = format!("{}%", year_month);
+    let mut stmt = conn
+        .prepare(
+            "SELECT session_id FROM sessions WHERE started_at LIKE ?1 ORDER BY started_at ASC",
+        )
+        .context("preparing month session query")?;
+    let rows = stmt
+        .query_map(rusqlite::params![prefix], |row| row.get::<_, String>(0))
+        .context("querying sessions by month")?
+        .collect::<Result<Vec<_>, _>>()
+        .context("reading session id rows")?;
+    Ok(rows)
+}
+
 /// Update the `last_activity_at` column for a session.
 ///
 /// Called after a successful backfill so spend queries can find recently-active sessions.

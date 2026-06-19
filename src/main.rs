@@ -10,6 +10,7 @@ macro_rules! tlog {
 
 use trakr::archive;
 use trakr::backfill;
+use trakr::breakdown;
 use trakr::hooks;
 use trakr::storage;
 
@@ -152,6 +153,15 @@ enum Commands {
         #[arg(long, short = 'r')]
         reason: Option<String>,
     },
+    /// Show token spend broken down by activity category (code reads, writes, execution, etc.)
+    Breakdown {
+        /// Show breakdown for a single session only
+        #[arg(long, short = 's')]
+        session: Option<String>,
+        /// Filter to a specific month (YYYY-MM); ignored when --session is given
+        #[arg(long, short = 'm')]
+        month: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -203,6 +213,7 @@ fn run(cli: Cli) -> Result<()> {
             OtelAction::Disable => cmd_otel_disable(),
         },
         Commands::Adjust { day, amount, reason } => cmd_adjust(&day, amount, reason),
+        Commands::Breakdown { session, month } => cmd_breakdown(session.as_deref(), month.as_deref()),
     }
 }
 
@@ -1946,6 +1957,146 @@ fn cmd_adjust(day: &str, amount: f64, reason: Option<String>) -> Result<()> {
     if let Some(r) = reason {
         println!("Reason: {}", r);
     }
+    Ok(())
+}
+
+// ── Activity breakdown ────────────────────────────────────────────────────────
+
+fn cmd_breakdown(session: Option<&str>, month: Option<&str>) -> Result<()> {
+    use trakr::rates;
+
+    let home = dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
+    let transcripts_dir = home.join(".trakr").join("transcripts");
+
+    if !transcripts_dir.exists() {
+        println!("No transcripts found at {}.", transcripts_dir.display());
+        println!("Run `trakr init` and let a session complete to populate transcripts.");
+        return Ok(());
+    }
+
+    let card = rates::load_rate_card();
+
+    let rows = if let Some(sid) = session {
+        // Single session.
+        let path = transcripts_dir.join(format!("{}.jsonl", sid));
+        if !path.exists() {
+            anyhow::bail!("No transcript found for session {}.", sid);
+        }
+        breakdown::compute_breakdown_from_transcript(&path, &card)?
+    } else {
+        // All sessions, optionally filtered by month.
+        let session_ids: Option<std::collections::HashSet<String>> = if let Some(ym) = month {
+            storage::init_db()?;
+            let ids = storage::get_session_ids_for_month(ym)?;
+            Some(ids.into_iter().collect())
+        } else {
+            None
+        };
+
+        let mut entries: Vec<std::fs::DirEntry> = std::fs::read_dir(&transcripts_dir)
+            .context("reading transcripts directory")?
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .map_or(false, |ext| ext == "jsonl")
+            })
+            .collect();
+        entries.sort_by_key(|e| e.file_name());
+
+        let mut all_rows: Vec<Vec<breakdown::BreakdownRow>> = Vec::new();
+        let mut n_processed = 0usize;
+        let mut n_skipped = 0usize;
+
+        for entry in &entries {
+            let path = entry.path();
+            let sid = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+
+            if let Some(ref allowed) = session_ids {
+                if !allowed.contains(&sid) {
+                    n_skipped += 1;
+                    continue;
+                }
+            }
+
+            match breakdown::compute_breakdown_from_transcript(&path, &card) {
+                Ok(rows) => {
+                    all_rows.push(rows);
+                    n_processed += 1;
+                }
+                Err(e) => {
+                    eprintln!("Warning: skipping {}: {}", path.display(), e);
+                    n_skipped += 1;
+                }
+            }
+        }
+
+        if n_processed == 0 {
+            if let Some(ym) = month {
+                println!("No transcripts found for {}.", ym);
+            } else {
+                println!("No transcripts found.");
+            }
+            return Ok(());
+        }
+
+        eprintln!(
+            "Processed {} transcript(s){}.",
+            n_processed,
+            if n_skipped > 0 { format!(", {} skipped", n_skipped) } else { String::new() }
+        );
+
+        breakdown::merge_rows(all_rows)
+    };
+
+    if rows.is_empty() {
+        println!("No assistant turns found in transcript(s).");
+        return Ok(());
+    }
+
+    let total_cost: f64 = rows.iter().map(|r| r.cost_usd).sum();
+    let total_turns: u64 = rows.iter().map(|r| r.turns).sum();
+
+    let header = match (session, month) {
+        (Some(sid), _) => format!("trakr breakdown — session {}", &sid[..sid.len().min(12)]),
+        (None, Some(ym)) => format!("trakr breakdown — {}", ym),
+        (None, None) => "trakr breakdown — all sessions".to_string(),
+    };
+    println!("{}", header);
+    println!("{}", "=".repeat(header.len().max(60)));
+    println!();
+    println!(
+        "  {:<14}  {:>6}  {:>9}  {:>9}  {:>11}  {:>9}  {:>6}",
+        "Category", "Turns", "Input", "Output", "Cache read", "Cost", "Share"
+    );
+    println!("  {}", "-".repeat(71));
+
+    for row in &rows {
+        let share = if total_cost > 0.0 {
+            row.cost_usd / total_cost * 100.0
+        } else {
+            0.0
+        };
+        println!(
+            "  {:<14}  {:>6}  {:>9}  {:>9}  {:>11}  {:>9}  {:>5.1}%",
+            row.category.label(),
+            row.turns,
+            fmt_tokens_compact(row.input_tokens),
+            fmt_tokens_compact(row.output_tokens),
+            fmt_tokens_compact(row.cache_read_tokens),
+            format!("${:.2}", row.cost_usd),
+            share,
+        );
+    }
+
+    println!("  {}", "-".repeat(71));
+    println!(
+        "  {:<14}  {:>6}  {:>47}  {:>5.1}%",
+        "Total", total_turns, format!("${:.2}", total_cost), 100.0
+    );
+    println!();
+
     Ok(())
 }
 

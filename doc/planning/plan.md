@@ -192,6 +192,22 @@ Key findings:
 - TODO - `trakr list` — show title alongside session ID and project
 - NOTE - `inspect-logs --verbose` now shows title + per-session spend (2026-06-14)
 
+## Phase 4f: Activity Spend Breakdown
+
+### Action 4f.1: `trakr breakdown` command
+- ✓ DONE - `src/breakdown.rs` — per-category token breakdown from archived transcripts
+  - `ToolCategory` enum: CodeRead, CodeWrite, Execution, WebResearch, Delegation, Response, Other
+  - `categorise_tool(name)` + `categorise_turn(tools)` — priority-based classification
+  - `compute_breakdown_from_transcript(path, card)` — deduplicates by `message.id` (same logic as PerModelAccumulator); groups tool names per turn; computes cost per category
+  - `merge_rows(all)` — aggregate across multiple sessions
+  - 6 unit tests (categorisation rules + merge correctness); 81 tests total
+- ✓ DONE - `storage::get_session_ids_for_month(year_month)` — queries sessions WHERE started_at LIKE 'YYYY-MM%'
+- ✓ DONE - `trakr breakdown [--session <id>] [--month YYYY-MM]` CLI command
+  - No args: aggregates all transcripts in `~/.trakr/transcripts/`
+  - `--month`: filters via DB session IDs then loads matching transcripts
+  - `--session`: single transcript
+  - Output: table with Turns, Input, Output, Cache read, Cost, Share columns
+
 ## Phase 4e: Dynamic Pricing via LiteLLM
 
 ### Action 4e.1: Live rate card from LiteLLM
@@ -523,6 +539,25 @@ Design doc: `doc/planning/otel-gap-fill-plan.md`
 2. Action 5.6 Phase D — `trakr status` warn if OTEL enabled but no batches received in >90 s
 3. Action 5.4 — CodeQL setup (reference: `~/projects/tsk`)
 4. GitHub Actions CI/CD (Action 5.3)
+
+─────────────────────────────────────────────────────────────────────────────
+
+## ── CHECKPOINT: Session 2026-06-19 (trakr breakdown) ──────────────────────────
+
+**What was completed this session:**
+- `trakr breakdown` command implemented: classifies every API turn by the tools called and attributes token cost to one of 7 categories (CodeRead, CodeWrite, Execution, WebResearch, Delegation, Response, Other)
+- `src/breakdown.rs` added (~200 lines): categorisation logic, per-transcript computation, multi-session merge
+- `storage::get_session_ids_for_month` added for `--month` filtering
+- 8 new tests (6 categorisation + 2 merge); 81 total passing
+- Sample output (June 2026, 79 sessions): CodeWrite 32.6% ($106), Execution 25.9% ($84), Response 20.3% ($66), CodeRead 15.2% ($50), WebResearch 1.6% ($5)
+
+**State of the project:**
+- 81 tests passing; `cargo build` clean; `trakr breakdown` ready to use
+
+**Immediate next priorities:**
+1. Action 4d.3 — `trakr list` with title + project; `trakr show` with title + summary
+2. Action 5.4 — CodeQL setup (reference: `~/projects/tsk`)
+3. GitHub Actions CI/CD (Action 5.3)
 
 ─────────────────────────────────────────────────────────────────────────────
 
