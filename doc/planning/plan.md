@@ -1,9 +1,10 @@
 # Implementation Plan
 
 ## ── WHAT'S NEXT ──────────────────────────────────────────────────────────
-**Next:** Action 4d.3 — `trakr list` with title + project; `trakr show` with title + summary
+**Next:** Publish v0.1.16 (OTEL removed from `trakr audit` output + enterprise note), then run `trakr audit <actual>` on the WORK machine and read the per-model table vs claude.ai to locate the ~$100 gap.
+**Then:** Action 4d.3 — `trakr list` with title + project; `trakr show` with title + summary
 **Sub-doc:** (none)
-**Blockers:** None
+**Blockers:** None — v0.1.16 release build clean
 ─────────────────────────────────────────────────────────────────────────────
 
 ## Phase 1: Project Foundation
@@ -136,6 +137,7 @@ Design doc: `doc/claude-session-logs.md`
 ## Phase 4c: Architecture Hardening
 
 ### Action 4c.1: SessionEnd → full JSONL parse pipeline
+- **[RETIRED 2026-06-23]** — hooks are no longer the ingestion path. `trakr init` installs NO hooks; ingestion is sweep-only (`serve` reconciliation loop + inline sweep in `spend`/`sync`). `handle_session_end` and the `trakr hook` subcommand remain only for back-compat with old installs. See Action 5.8 checkpoint.
 - ✓ DONE - `handle_session_end` now calls `backfill::parse_session_log` + `storage::replace_session`
   - Accurate summed token counts across all turns (was last-turn-only — $0.24 → $281.70 on fresh backfill)
   - One atomic write per session; idempotent; ground truth from Claude's own log
@@ -152,8 +154,9 @@ Design doc: `doc/claude-session-logs.md`
 - NOTE: originally labelled "OTEL receiver" in early planning — refers to concurrency hardening; not superseded
 
 ### Action 4c.4: Hook config correctness
-- ✓ DONE - `cmd_init` merges `SessionStart`/`SessionEnd` hooks into `~/.claude/settings.json` directly (idempotent)
-- ✓ DONE - `suggested_hook_config()` updated to correct event names; no more `PostToolUse`/`Stop`
+- **[RETIRED 2026-06-23]** — `cmd_init` no longer writes hooks to `~/.claude/settings.json` (only OTEL env vars when OTEL is enabled). The hook-merge code has been removed; ingestion is sweep-based.
+- ✓ DONE - ~~`cmd_init` merges `SessionStart`/`SessionEnd` hooks into `~/.claude/settings.json` directly (idempotent)~~
+- ✓ DONE - ~~`suggested_hook_config()` updated to correct event names; no more `PostToolUse`/`Stop`~~
 
 ### Action 4c.5: Reconciliation sweep
 - ✓ DONE - `run_log_reconciliation()` called on `serve` startup — backfills any sessions whose `SessionEnd` hook was missed before Claude's 30-day log retention expires
@@ -302,6 +305,21 @@ Design doc: `doc/planning/otel-gap-fill-plan.md`
 - ✓ DONE - `doc/otel-enterprise-investigation.md` added: full binary analysis, two OTEL code paths, workarounds considered and rejected
 - ✓ DONE - v0.1.7 / v0.1.8 / v0.1.9 bumped in `Cargo.toml`
 
+### Action 5.8: `trakr audit <actual>` — discrepancy locator
+- ✓ DONE - `trakr audit <actual> [--month YYYY-MM] [--yes]` in `src/main.rs` (`cmd_audit`)
+- ✓ DONE - Deliberately does NOT run a reconciliation sweep first — surfaces sessions on disk but missing from DB
+- ✓ DONE - Decomposes gap: `actual` (claude.ai) − trakr total (transcripts + background + adjustment) = gap
+- ✓ DONE - Orphan scan: `discover_sessions` + `parse_session_log` over `~/.claude/projects`; filter by `last_activity_at` month (matches DB's MAX-timestamp attribution); session IDs not in `get_session_ids_for_month` are orphans; priced via `price_session_events` helper (sums `TokenUsage` events × rate card, identical to `get_monthly_spend_usd`)
+- ✓ DONE - Residual = gap − untracked; sign-aware hints (under-report → background/rate-card; over-report → duplicate sessions/double-counted subagents)
+- ✓ DONE - Offers reconciling `CostAdjustment` for residual ONLY when no material orphans (>$1) — otherwise recommends `trakr sync` first to avoid double-count after future ingestion; adjustment dated today (current month) or month-end (past month)
+- ✓ DONE - **Explanatory enrichment** (audit must explain, not just calculate the gap):
+  - Per-model spend table (`storage::get_monthly_spend_by_model` + `model_tier`) shown under the residual so the user can eyeball trakr's Opus/Sonnet/Haiku/Fable split against claude.ai's per-model usage screen — pinpoints WHICH tier is short
+  - Directional guidance: more Haiku on claude.ai → invisible background calls (suggest `otel enable`); short paid tier → cross-machine usage under same account
+  - Diagnostics block: coverage (disk logs in month vs tracked count), OTEL state (measured vs flat estimate), rate-card sync age (warns >48h stale)
+- ✓ DONE - README: Features bullet, commands table row, "Auditing the discrepancy" section (sample output corrected — sweep-based, not hook-based)
+- ✓ DONE - v0.1.15 bumped; 89 tests passing (`model_tier` test added; rest composes already-tested library fns)
+- NOTE - Untracked-log orphan detection is the new diagnostic; `trakr breakdown` footer only caught the inverse (DB rows w/ no transcript)
+
 ### Action 5.5: Anthropic Analytics API integration (optional "exact mode")
 - TODO - `GET /v1/organizations/analytics/cost_report` — returns pre-calculated spend in cents; no token multiplication needed
 - TODO - Auth: `x-api-key` with `read:analytics` scope (org admin key — not available to all users)
@@ -312,126 +330,6 @@ Design doc: `doc/planning/otel-gap-fill-plan.md`
 - NOTE - Per-user endpoint: `GET /analytics/cost_report?user_ids[]=<id>&bucket_width=1d` — allows per-user filtering within an org
 
 ---
-
-## ── CHECKPOINT: Session 2026-06-14 (dynamic pricing + UX fixes) ────────────
-
-**What was completed this session:**
-- Phase 4e fully implemented: `src/rates.rs` — fetch/cache/resolve from LiteLLM price list
-- `src/cost.rs` refactored to use `rates::resolve`; cache_creation rate corrected to 1.25× input (was 1×)
-- `src/storage.rs` — 3 spend query functions load rate card once per call, not per event
-- `trakr sync-rates` command — fetches rates, logs timestamped line to `serve.log`, prints "Rates synced (N models)" to stdout
-- `trakr serve` — daily rates refresh task alongside existing archive sweep
-- `trakr status` — Storage section now shows rates.json last-fetched age; stale if > 48 h
-- Daemon startup log: `home=` now shows `~/.trakr` instead of `~`
-
-**State of the project:**
-- 66 tests passing; `cargo build` clean; `trakr sync-rates` live (237 Claude models cached)
-- Rate card sourced from LiteLLM with exact key matches for all current Claude Code models; hardcoded fallback retained for offline use
-- `trakr serve` daemon still running (launchd); will pick up daily rate refresh on next 24 h cycle
-
-**Immediate next priorities:**
-1. Action 4d.3 — `trakr list` with title + project; `trakr show` with title + summary
-2. Filtering/JSON output on `list`, `show`, `stats`
-3. README update to document `sync-rates`, `sync`, `inspect-logs` redesign, no-hooks architecture
-4. CI/CD and crates.io publication (Action 5.3)
-
-─────────────────────────────────────────────────────────────────────────────
-
-## ── CHECKPOINT: Session 2026-06-15 (publish + UX polish) ──────────────────
-
-**What was completed this session:**
-- Crate renamed `ctx-trakr` → `trakr`; GitHub repo renamed to `ubiqtek-ai/trakr`; all `ctx_trakr::` imports updated in `src/main.rs`
-- Published `trakr v0.1.0` then `v0.1.1` to crates.io
-- `Cargo.toml`: added `homepage`, `repository`, `keywords`, `categories`
-- README: title updated, Quick start rewritten (no hooks/OTEL, startup reconciliation handles backfill, `trakr inspect` added)
-- `LAUNCH_AGENT_LABEL` corrected to `io.ubiqtek.trakr.serve`
-- Clap `name = "ctx-trakr"` fixed to `"trakr"` (was showing wrong name in `--version`)
-- DB freshness in `trakr status` now shows human-readable age (`3h 42m ago` / `1d 5h ago`)
-- `trakr inspect`: token totals added to summary (all-time + monthly, K/M compact format)
-- `inspect-logs` subcommand renamed to `inspect`
-- `Justfile`: `install-cli` now passes `--force`
-
-**State of the project:**
-- 66 tests passing; `cargo build` clean; `trakr v0.1.1` live on crates.io
-- Diagnosing spend accuracy on work machine (installing fresh and comparing `trakr inspect` + `trakr spend` output)
-
-**Immediate next priorities:**
-1. Diagnose spend accuracy on work machine using `trakr inspect` token totals
-2. Action 4d.3 — `trakr list` with title + project; `trakr show` with title + summary
-3. Action 5.4 — CodeQL setup (reference: `~/projects/tsk`)
-4. GitHub Actions CI/CD (Action 5.3)
-
-─────────────────────────────────────────────────────────────────────────────
-
-## ── CHECKPOINT: Session 2026-06-15 (v0.1.2 + spend gap diagnosis) ──────────
-
-**What was completed this session:**
-- `trakr stats` extended: per-model token breakdown table (Input / Out / Cache read / Cache create columns with K/M compact format); session list hidden behind `--verbose`
-- `fmt_tokens_compact()` helper added to `src/main.rs`
-- `trakr v0.1.2` published to crates.io
-- Spend gap diagnosis completed for work machine: Anthropic June ($255.50) vs trakr all-time ($244.05) = $11.45 net gap. Confirmed 125 subagent JSONL files = 125 Agent calls (all accounted for). LiteLLM rate card matches Anthropic published pricing exactly. Gap explained by Claude usage before May 26 (pre-installation on work machine). `<synthetic>` model holds 0 tokens — not a factor.
-
-**State of the project:**
-- `trakr v0.1.2` live on crates.io; spend tracking accurate on both home and work machines
-- 66 tests passing; `cargo build` clean; launchd service running
-
-**Immediate next priorities:**
-1. Action 4d.3 — `trakr list` with title + project; `trakr show` with title + summary
-2. Action 5.4 — CodeQL setup (reference: `~/projects/tsk`)
-3. GitHub Actions CI/CD (Action 5.3)
-4. README update for `sync`, `inspect` redesign, `repair` default, no-hooks architecture
-
-─────────────────────────────────────────────────────────────────────────────
-
-## ── CHECKPOINT: Session 2026-06-15 (stats --month + spend gap deep dive) ──
-
-**What was completed this session:**
-- `trakr stats --month YYYY-MM` flag added (`src/main.rs`): filters token breakdown and session list by event timestamp month; "Month: YYYY-MM" header when active
-- `trakr v0.1.3` published to crates.io
-- Spend gap diagnosis deepened on work machine (Anthropic $254.77 June vs trakr $206.35):
-  - Work app screenshot confirmed 100% `claude_code` product — no web/API-key usage
-  - Per-model breakdown from work app: Opus $135.21, Sonnet $111.87, Haiku $7.70
-  - `trakr stats --month 2026-06` on work machine: Sonnet ~$88.6, Opus ~$114.2, Haiku ~$4.7
-  - Undercount ratios: Haiku 64%, Sonnet 26%, Opus 18% — NOT uniform, Haiku worst
-  - File count: 37 JSONL files on disk = 37 trakr sessions (no missing parent sessions)
-  - Subagent structure: 125 files, all depth-1 flat (`<uuid>/subagents/agent-*.jsonl`) — no nested agents
-  - **Working hypothesis:** Claude Code makes background API calls (compact summary generation, title generation) that don't appear in session JSONLs and are invisible to trakr
-  - **Next diagnostic:** Python one-liner to sum tokens directly from JSONL files to verify if the files themselves contain the missing tokens (awaiting result from work machine)
-
-**State of the project:**
-- `trakr v0.1.3` live on crates.io; 66 tests passing; `cargo build` clean
-- Spend gap is real (~$48 in June), cause not yet confirmed — hypothesis is background API calls outside session JSONLs
-
-**Immediate next priorities:**
-1. Run JSONL token-sum diagnostic on work machine to confirm/refute background-call hypothesis
-2. If confirmed: document the known gap in README/inspect output; consider if OTEL can fill it
-3. Action 4d.3 — `trakr list` with title + project; `trakr show` with title + summary
-4. Action 5.4 — CodeQL setup (reference: `~/projects/tsk`)
-5. GitHub Actions CI/CD (Action 5.3)
-
-─────────────────────────────────────────────────────────────────────────────
-
-## ── CHECKPOINT: Session 2026-06-15 (OTEL gap-fill plan + doc updates) ──────────
-
-**What was completed this session:**
-- Remaining ~9% spend gap ($232 vs $255.50) diagnosed as background Haiku API calls (title/summary generation) invisible to transcripts
-- Anthropic Analytics API documented (`/v1/organizations/analytics/cost_report`) — org admin key required, not available; added as Action 5.5
-- `claude-usage-tracker` 0.71 calibration factor analysed: compensates for no `message.id` dedup + wrong model prices in that tool — not a fundamental pricing truth; trakr fixes at source
-- README updated: cache rate table corrected (1h=2×, 5m=1.25×), "Spend accuracy" section added (known gap, background calls, comparison with other trackers, future Analytics API)
-- `doc/planning/otel-gap-fill-plan.md` written: full phased plan for optional OTEL gap-fill (Phase A dump experiment → Phase B config/CLI → Phase C Option 2 or 3 → Phase D UX)
-- Action 5.6 added to main plan; WHAT'S NEXT updated to point at Phase A experiment
-
-**State of the project:**
-- `trakr v0.1.4` built locally (not yet published); 68 tests passing; spend $232/month vs $255.50 Anthropic (~9% gap, documented as known limitation)
-- OTEL gap-fill fully designed but not yet implemented; next step is the attribute dump experiment to choose between Option 2 (per-request-id dedup) and Option 3 (per-model token subtraction)
-
-**Immediate next priorities:**
-1. Publish v0.1.4 (1h cache tier fix)
-2. Action 5.6 Phase A — OTEL attribute dump experiment (30 min, gates all subsequent OTEL work)
-3. Action 5.6 Phase B — `otel_enabled` config flag + `trakr otel install/uninstall` CLI
-4. Action 4d.3 — `trakr list` with title + project; `trakr show` with title + summary
-
-─────────────────────────────────────────────────────────────────────────────
 
 ## ── CHECKPOINT: Session 2026-06-15 (1h cache tier pricing fix) ──────────────
 
@@ -596,6 +494,71 @@ Design doc: `doc/planning/otel-gap-fill-plan.md`
 1. Action 4d.3 — `trakr list` with title + project; `trakr show` with title + summary
 2. Action 5.4 — CodeQL setup (reference: `~/projects/tsk`)
 3. GitHub Actions CI/CD (Action 5.3)
+
+─────────────────────────────────────────────────────────────────────────────
+
+## ── CHECKPOINT: Session 2026-06-23 (spend/breakdown reconciliation) ──────────
+
+**What was completed this session:**
+- Root-cause analysis of spend vs breakdown gap on work machine ($317.24 breakdown vs $353.42 trakr spend): reconciled as $1.70 DB gap (sessions with no transcript file) + $19.14 background + $15.34 adjustment
+- `server.rs` `/spend/monthly` fixed: `spent_estimated_usd` now returns full total (transcripts + background + adjustment); `SpendSources` gains `background_usd` and `adjustment_usd` fields — endpoint was stale since background/adjustment were added to `trakr spend --json` but server was never updated
+- `trakr breakdown` reconciliation footer added: shows how breakdown total → trakr spend total, using same background resolution logic as `cmd_spend` (OTEL if enabled, else `background_factor` estimate, else zero); identifies count + cost of sessions in DB with no transcript file
+- v0.1.14 published to crates.io; 88 tests passing
+
+**State of the project:**
+- `trakr spend --json` `total_usd`, the HTTP API `spent_estimated_usd`, and `trakr breakdown` footer `trakr spend total` all return the same figure
+- 88 tests passing; `cargo build` clean; v0.1.14 live on crates.io
+
+**Immediate next priorities:**
+1. Action 4d.3 — `trakr list` with title + project; `trakr show` with title + summary
+2. Action 5.4 — CodeQL setup (reference: `~/projects/tsk`)
+3. GitHub Actions CI/CD (Action 5.3)
+
+─────────────────────────────────────────────────────────────────────────────
+
+## ── CHECKPOINT: Session 2026-06-23 (trakr audit — discrepancy locator) ──────
+
+**What was completed this session:**
+- Work-machine spend was ~$100 under claude.ai; built `trakr audit <actual>` (Action 5.8) to locate the cause
+- `cmd_audit` in `src/main.rs`: reads DB total without a sweep, then scans `~/.claude/projects` for session logs whose `last_activity_at` falls in the month but whose session ID is absent from `get_session_ids_for_month` — "untracked logs on disk", priced identically via `price_session_events`
+- **Made audit explanatory, not just arithmetic** (user feedback: it was only calculating the gap): per-model spend table (`storage::get_monthly_spend_by_model` + `model_tier`) to compare against claude.ai's per-model screen, directional guidance (more Haiku → background calls; short paid tier → cross-machine), and a Diagnostics block (coverage disk-vs-tracked, OTEL state, rate-card sync age)
+- **Hook ingestion path RETIRED** (user pointed out the SessionEnd hook was supposed to be gone): confirmed `cmd_init` installs no hooks — ingestion is sweep-only. Marked `Commands::Hook` doc + plan Actions 4c.1/4c.4 as retired/back-compat-only. Handlers kept for old installs (deleting would break installs with the hook wired and no daemon)
+- **`trakr spend` layout fix**: moved Total to its own line at the bottom under a rule (Budget/Used now sit above it); was confusingly buried mid-list
+- README: Features bullet, commands table row, "Auditing the discrepancy" section (sample output corrected to sweep-based, not hook-based); Cargo.toml → v0.1.15
+
+**State of the project:**
+- `cargo build` clean; 89 tests passing; v0.1.15 ready to commit/publish (not yet published)
+- Home machine: 0 cost-bearing orphans, so audit goes to residual + per-model — the diagnostics surfaced a real finding (rate card 74h stale; OTEL disabled). Orphan path needs the work machine to exercise fully
+- `trakr audit <actual>` is the recommended first step whenever trakr drifts from claude.ai
+
+**Immediate next priorities:**
+1. Run `trakr audit <work-actual>` on the work machine — read the per-model table against claude.ai's per-model split to see which tier is short
+2. Publish v0.1.15 to crates.io
+3. Action 4d.3 — `trakr list` with title + project; `trakr show` with title + summary
+4. Action 5.4 — CodeQL setup (reference: `~/projects/tsk`)
+
+─────────────────────────────────────────────────────────────────────────────
+
+## ── CHECKPOINT: Session 2026-06-23 (OTEL removed from audit output) ─────────
+
+**What was completed this session:**
+- Stripped OTEL from `cmd_audit` output in `src/main.rs` (enterprise accounts can't use OTEL):
+  - Background calc no longer reads `get_monthly_background_spend_usd` / shows "N OTEL calls"; Background is always the flat `background_factor` estimate
+  - Removed the residual guidance line suggesting `trakr otel enable`
+  - Replaced the "OTEL gap-fill" Diagnostics line with `Background  flat estimate, not measured`
+  - Added a foot-of-output note: background API calls (title/summary, mostly Haiku) are billed but never appear in transcripts; capturing them would need OTEL, unavailable on enterprise — so Background is an estimate
+- README: refreshed `trakr audit` sample output to match (per-model split + Diagnostics block + enterprise note); "Residual (unexplained)" → "Residual after ingest"
+- Cargo.toml → v0.1.16; release build clean
+
+**State of the project:**
+- `cargo build --release` clean; v0.1.16 ready to commit/publish (user publishing)
+- Audit path is now OTEL-free in both command output and docs; enterprise limitation explained inline
+
+**Immediate next priorities:**
+1. Publish v0.1.16 to crates.io
+2. Run `trakr audit <work-actual>` on the work machine — read per-model table vs claude.ai
+3. Action 4d.3 — `trakr list` with title + project; `trakr show` with title + summary
+4. Action 5.4 — CodeQL setup (reference: `~/projects/tsk`)
 
 ─────────────────────────────────────────────────────────────────────────────
 

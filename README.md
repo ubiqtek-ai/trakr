@@ -9,6 +9,7 @@ A Rust CLI that tracks Claude Code context usage and estimates spend across all 
 - **Month-to-date spend** — aggregates all recorded sessions against a configurable monthly budget
 - **OTEL gap-fill** — `trakr init` enables OTEL by default; background API calls (title/summary generation) that are invisible in transcripts are captured from the OTEL log stream and shown as a separate "Background" line in `trakr spend`
 - **Manual adjustments** — `trakr adjust <day> <amount>` records a signed correction (positive or negative) attributed to a specific day; useful for pre-installation gaps or price-change corrections
+- **Spend audit** — `trakr audit <actual>` reconciles trakr's estimate against the real claude.ai figure, finds untracked session logs on disk, and isolates the residual unexplained gap
 - **Pipeline health check** — `trakr status` checks DB freshness and server; OTEL/env-var indicators are informational
 - **Backfill & reconciliation** — imports historical sessions from Claude Code's native logs; a 30 s reconciliation loop in `trakr serve` catches sessions in progress and any sessions missed due to crash or force-quit
 - **Archive** — `trakr archive` mirrors `~/.claude/projects/` to `~/.trakr/archive/` incrementally; `trakr serve` runs this daily
@@ -144,6 +145,66 @@ When adjustments exist for the current month, `trakr spend` shows them as a sepa
 
 Adjustments are stored as events in the DB with a full audit trail — they are never silently modified by reconciliation sweeps.
 
+### Auditing the discrepancy
+
+When trakr's figure drifts from what Anthropic actually bills, copy the real total from **claude.ai → Settings → Usage** and run:
+
+```bash
+trakr audit 254.77            # current month
+trakr audit 254.77 --month 2026-05
+```
+
+`audit` does **not** run a reconciliation sweep first — that is the point. It compares claude.ai's figure against trakr's current DB total and decomposes the gap:
+
+```
+trakr audit — 2026-06
+========================================
+
+  Reported actual                $254.77   (claude.ai)
+  ────────────────────────────────────────
+  trakr total                    $206.35
+    Transcripts                  $182.89   (37 sessions)
+    Background                    $10.97   (est. 6%)
+    Adjustment                    +12.49
+  ────────────────────────────────────────
+  Gap (under-reported)            $48.42   (19.0%)
+
+  Untracked logs on disk          $40.00   (4 sessions missing from trakr)
+    a1b2c3d4   my-project                   $22.10
+    e5f6a7b8   other-repo                    $17.90
+  → Run `trakr sync` to ingest these, then re-run `trakr audit`.
+
+  Residual after ingest            $8.42   (3.3%)
+
+  Where the gap likely is — trakr's transcript spend by model
+  (open claude.ai → Usage and compare the per-model split):
+  ────────────────────────────────────────
+    Sonnet       $108.40     59%
+    Opus          $66.21     36%
+    Haiku          $8.28      5%
+  → If claude.ai shows materially MORE Haiku than trakr does, the gap is
+    background Haiku calls (title/summary) — invisible to transcripts and
+    not separately measurable on enterprise accounts (see note below).
+  → If a paid tier (Opus/Sonnet) is short, it's likely usage on another
+    machine under the same account — trakr only sees THIS machine's logs.
+
+  Diagnostics
+  ────────────────────────────────────────
+    Coverage (this month)  41 logs on disk / 37 tracked   ← untracked logs above
+    Background             flat estimate, not measured
+    Rate card synced       6h ago
+
+  Note: background API calls (title/summary generation, mostly Haiku) are billed
+  by Anthropic but never appear in local transcripts. Capturing them would need
+  OTEL, which is unavailable on enterprise accounts — so the Background figure
+  above is a flat estimate, not a measured value.
+```
+
+- **Untracked logs on disk** are Claude `.jsonl` sessions that trakr never ingested. Because ingestion is sweep-based, this happens when the `trakr serve` daemon wasn't running and you never ran `trakr spend`/`trakr sync` to trigger an inline sweep (or a session ended and was pruned before any sweep saw it). Each is priced exactly as trakr would once ingested. If any are found, audit tells you to `trakr sync` first rather than papering over real data.
+- **Residual** is what remains once untracked logs are accounted for — invisible background API calls and rate-card estimation error (see [Spend accuracy](#spend-accuracy)).
+
+If there are no untracked logs, audit offers to record a reconciling `adjust` for the residual so `trakr spend` matches claude.ai. Pass `--yes` to skip the prompt.
+
 ### tmux status line
 
 Poll the API and format the result for your status line. Example using `jq`:
@@ -210,6 +271,7 @@ If you change `otel_port` and are using the optional OTEL cross-check, update `O
 | `trakr status` | Health-check: DB freshness, server reachability, OTEL state |
 | `trakr spend` | Month-to-date spend (runs inline sweep; no server required) |
 | `trakr adjust <day> <amount>` | Record a signed spend adjustment for a specific day (`--reason` optional) |
+| `trakr audit <actual>` | Reconcile against the real claude.ai figure; locate untracked logs and the residual gap (`--month`, `--yes`) |
 | `trakr sync` | Manually trigger a reconciliation sweep and print a summary |
 | `trakr sync-rates` | Fetch current model pricing from LiteLLM and cache to `~/.trakr/rates.json` |
 | `trakr serve` | Run the 30 s reconciliation loop and daily archive sweep (foreground) |

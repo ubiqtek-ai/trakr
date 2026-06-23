@@ -555,6 +555,95 @@ pub fn get_monthly_spend_usd(year_month: &str) -> Result<(f64, usize)> {
     Ok((total_usd, sessions_this_month.len()))
 }
 
+/// Collapse a full model id (`claude-opus-4-...`) to a coarse tier for display.
+///
+/// Matches the tiers claude.ai's usage screen reports, so trakr's per-model spend can be
+/// eyeballed against it directly.
+pub fn model_tier(model: &str) -> &'static str {
+    let m = model.to_lowercase();
+    if m.contains("opus") {
+        "Opus"
+    } else if m.contains("sonnet") {
+        "Sonnet"
+    } else if m.contains("haiku") {
+        "Haiku"
+    } else if m.contains("fable") {
+        "Fable"
+    } else {
+        "Other"
+    }
+}
+
+/// Per-model (tier) transcript spend for a month, sorted by cost descending.
+///
+/// Same session-selection rule as `get_monthly_spend_usd` (last token_usage in the month),
+/// but cost is accumulated per coarse model tier instead of summed.
+pub fn get_monthly_spend_by_model(year_month: &str) -> Result<Vec<(String, f64)>> {
+    use crate::cost::compute_cost_usd_with_card;
+    use crate::rates;
+    let card = rates::load_rate_card();
+
+    let conn = open_db()?;
+
+    let sessions_this_month: Vec<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT session_id \
+             FROM events \
+             WHERE event_type = 'token_usage' \
+             GROUP BY session_id \
+             HAVING strftime('%Y-%m', MAX(timestamp)) = ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![year_month], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()
+            .context("reading sessions with token_usage this month")?;
+        rows
+    };
+
+    let mut by_tier: std::collections::HashMap<&'static str, f64> = std::collections::HashMap::new();
+
+    for session_id in &sessions_this_month {
+        let mut stmt = conn.prepare(
+            "SELECT payload FROM events \
+             WHERE session_id = ?1 AND event_type = 'token_usage'",
+        )?;
+        let payloads: Vec<String> = stmt
+            .query_map(params![session_id], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()
+            .context("reading token_usage payloads")?;
+
+        for payload in payloads {
+            let Ok(event) = serde_json::from_str::<crate::event::Event>(&payload) else { continue };
+            if let crate::event::Event::TokenUsage {
+                model,
+                input_tokens,
+                output_tokens,
+                cache_creation_input_tokens,
+                cache_read_input_tokens,
+                cache_creation_1h_input_tokens,
+                ..
+            } = event
+            {
+                let cost = compute_cost_usd_with_card(
+                    &model,
+                    input_tokens,
+                    output_tokens,
+                    cache_creation_input_tokens,
+                    cache_read_input_tokens,
+                    cache_creation_1h_input_tokens,
+                    &card,
+                );
+                *by_tier.entry(model_tier(&model)).or_insert(0.0) += cost;
+            }
+        }
+    }
+
+    let mut rows: Vec<(String, f64)> =
+        by_tier.into_iter().map(|(t, c)| (t.to_string(), c)).collect();
+    rows.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    Ok(rows)
+}
+
 /// Upsert project/timing/model/summary metadata for a session into the `sessions` table.
 ///
 /// Uses COALESCE so partial updates don't overwrite existing values with NULL.
@@ -1080,6 +1169,15 @@ mod tests {
             None => std::env::remove_var("HOME"),
         }
         result
+    }
+
+    #[test]
+    fn model_tier_collapses_full_ids() {
+        assert_eq!(model_tier("claude-opus-4-8-20260101"), "Opus");
+        assert_eq!(model_tier("claude-sonnet-4-6"), "Sonnet");
+        assert_eq!(model_tier("claude-haiku-4-5-20251001"), "Haiku");
+        assert_eq!(model_tier("claude-fable-5"), "Fable");
+        assert_eq!(model_tier("some-unknown-model"), "Other");
     }
 
     #[test]

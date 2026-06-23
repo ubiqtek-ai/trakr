@@ -34,7 +34,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Dispatch a Claude Code hook event (reads JSON from stdin)
+    /// Dispatch a Claude Code hook event (reads JSON from stdin).
+    ///
+    /// RETIRED as the primary ingestion path: `trakr init` no longer installs any hooks.
+    /// Ingestion is now sweep-based (`trakr serve`'s reconciliation loop + the inline sweep
+    /// in `trakr spend`/`trakr sync`). These handlers remain only for back-compat with older
+    /// installs whose `~/.claude/settings.json` still calls `trakr hook ...`.
     Hook {
         /// Hook event type: tool-use | session-start | session-end
         event_type: String,
@@ -156,6 +161,17 @@ enum Commands {
         #[arg(long, short = 'r')]
         reason: Option<String>,
     },
+    /// Reconcile trakr's estimate against the real claude.ai figure and locate the discrepancy
+    Audit {
+        /// The real spend figure copied from claude.ai → Settings → Usage (USD)
+        actual: f64,
+        /// Month to audit (YYYY-MM); defaults to the current month
+        #[arg(long, short = 'm')]
+        month: Option<String>,
+        /// Skip the confirmation prompt when recording the reconciling adjustment
+        #[arg(long)]
+        yes: bool,
+    },
     /// Show token spend broken down by activity category (code reads, writes, execution, etc.)
     Breakdown {
         /// Show breakdown for a single session only
@@ -219,6 +235,7 @@ fn run(cli: Cli) -> Result<()> {
             OtelAction::Disable => cmd_otel_disable(),
         },
         Commands::Adjust { day, amount, reason } => cmd_adjust(&day, amount, reason),
+        Commands::Audit { actual, month, yes } => cmd_audit(actual, month.as_deref(), yes),
         Commands::Breakdown { session, month, all } => cmd_breakdown(session.as_deref(), month.as_deref(), all),
     }
 }
@@ -1427,6 +1444,7 @@ fn cmd_spend(json: bool, all: bool) -> Result<()> {
     println!("Spend for {} ({} sessions)", month_label, count);
     println!("{}", "-".repeat(W));
 
+    // Component lines — shown only when more than one source contributes to the total.
     let multi_line = background > 0.0 || adjustment != 0.0;
     if multi_line {
         let transcript_val = format!("{:>width$}", format!("${:.2}", spent), width = VW);
@@ -1448,15 +1466,13 @@ fn cmd_spend(json: bool, all: bool) -> Result<()> {
             let adj_val = format!("{:>width$}", format!("{}{:.2}", sign, adjustment), width = VW);
             println!("  {:<width$} {}", "Adjustment", adj_val, width = LW);
         }
-        let total_val = format!("{:>width$}", format!("${:.2}", total), width = VW);
-        println!("  {:<width$} {}", "Total", total_val, width = LW);
-    } else {
-        let cost_val = format!("{:>width$}", format!("${:.2}", spent), width = VW);
-        println!("  {:<width$} {}", "Cost", cost_val, width = LW);
     }
 
     println!("  {:<width$} {}", "Budget", budget_val, width = LW);
     println!("  {:<width$} {}", "Used",   used_val,   width = LW);
+    println!("{}", "-".repeat(W));
+    let total_val = format!("{:>width$}", format!("${:.2}", total), width = VW);
+    println!("  {:<width$} {}", "Total", total_val, width = LW);
     println!("{}", "-".repeat(W));
     println!("Last updated: {}", human_ts);
 
@@ -1996,6 +2012,278 @@ fn cmd_adjust(day: &str, amount: f64, reason: Option<String>) -> Result<()> {
     if let Some(r) = reason {
         println!("Reason: {}", r);
     }
+    Ok(())
+}
+
+// ── Spend audit / reconciliation ──────────────────────────────────────────────
+
+/// Sum the cost of every `TokenUsage` event in a parsed session, using the rate card.
+///
+/// Mirrors how `storage::get_monthly_spend_usd` prices the DB rows, so an orphan log's
+/// estimated cost is directly comparable to what trakr would report once it ingests it.
+fn price_session_events(
+    session: &backfill::BackfilledSession,
+    card: &trakr::rates::RateCard,
+) -> f64 {
+    use trakr::cost::compute_cost_usd_with_card;
+    use trakr::event::Event;
+    let mut total = 0.0;
+    for (_, event) in &session.events {
+        if let Event::TokenUsage {
+            model,
+            input_tokens,
+            output_tokens,
+            cache_creation_input_tokens,
+            cache_read_input_tokens,
+            cache_creation_1h_input_tokens,
+            ..
+        } = event
+        {
+            total += compute_cost_usd_with_card(
+                model,
+                *input_tokens,
+                *output_tokens,
+                *cache_creation_input_tokens,
+                *cache_read_input_tokens,
+                *cache_creation_1h_input_tokens,
+                card,
+            );
+        }
+    }
+    total
+}
+
+/// Reconcile trakr's monthly estimate against the authoritative claude.ai figure.
+///
+/// Deliberately does NOT run a reconciliation sweep first — the whole point is to surface
+/// sessions present on disk but missing from the DB. Layered output:
+///   claude.ai (input) − trakr total = gap; orphan logs explain part of it; residual is the rest.
+fn cmd_audit(actual: f64, month: Option<&str>, yes: bool) -> Result<()> {
+    use trakr::{config, rates};
+    use std::io::Write as IoWrite;
+
+    let year_month = match month {
+        Some(m) => {
+            chrono::NaiveDate::parse_from_str(&format!("{}-01", m), "%Y-%m-%d")
+                .with_context(|| format!("'{}' is not a valid month — expected YYYY-MM", m))?;
+            m.to_string()
+        }
+        None => Utc::now().format("%Y-%m").to_string(),
+    };
+
+    storage::init_db()?;
+    let cfg = config::load_config().unwrap_or_default();
+    let card = rates::load_rate_card();
+
+    // ── trakr's current figure (DB only, no sweep) ──
+    let (transcripts, count) = storage::get_monthly_spend_usd(&year_month)?;
+
+    // Background: a flat estimate via the configured factor. (Live capture of background
+    // API calls would require OTEL, which is unavailable on enterprise accounts — see the
+    // note at the foot of the audit output.)
+    let (background, bg_note) = if cfg.background_factor > 0.0 {
+        (transcripts * cfg.background_factor, format!("est. {:.0}%", cfg.background_factor * 100.0))
+    } else {
+        (0.0, String::new())
+    };
+
+    let adjustment = storage::get_monthly_adjustment_usd(&year_month).unwrap_or(0.0);
+    let trakr_total = transcripts + background + adjustment;
+    let gap = actual - trakr_total;
+
+    // ── Orphan scan: logs on disk for this month with no DB rows ──
+    let home = dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
+    let projects_dir = home.join(".claude").join("projects");
+
+    let tracked_ids: std::collections::HashSet<String> =
+        storage::get_session_ids_for_month(&year_month)?.into_iter().collect();
+
+    let mut orphans: Vec<(String, String, f64)> = Vec::new(); // (id, project, cost)
+    let mut untracked_usd = 0.0;
+    let mut disk_in_month = 0usize; // session logs on disk attributable to this month
+    if projects_dir.exists() {
+        let paths = backfill::discover_sessions(&projects_dir, None, None)?;
+        for path in &paths {
+            let Ok(Some(session)) = backfill::parse_session_log(path) else { continue };
+            // Attribute to a month the same way the DB does: by last activity timestamp.
+            if session.last_activity_at.format("%Y-%m").to_string() != year_month {
+                continue;
+            }
+            disk_in_month += 1;
+            if tracked_ids.contains(&session.session_id) {
+                continue;
+            }
+            let cost = price_session_events(&session, &card);
+            if cost <= 0.0 {
+                continue;
+            }
+            let project = session
+                .project_path
+                .clone()
+                .unwrap_or_else(|| "?".to_string());
+            untracked_usd += cost;
+            orphans.push((session.session_id.clone(), project, cost));
+        }
+    }
+    orphans.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+
+    let residual = gap - untracked_usd;
+    let pct = |v: f64| if actual > 0.0 { v / actual * 100.0 } else { 0.0 };
+
+    // ── Report ──
+    const LW: usize = 26;
+    const VW: usize = 10;
+    let sep = "─".repeat(LW + VW + 4);
+    let money = |v: f64| format!("${:.2}", v);
+
+    let header = format!("trakr audit — {}", year_month);
+    println!("{}", header);
+    println!("{}", "=".repeat(header.len().max(LW + VW + 4)));
+    println!();
+    println!("  {:<LW$}  {:>VW$}   (claude.ai)", "Reported actual", money(actual));
+    println!("  {}", sep);
+    println!("  {:<LW$}  {:>VW$}", "trakr total", money(trakr_total));
+    println!("  {:<LW$}  {:>VW$}   ({} sessions)", "  Transcripts", money(transcripts), count);
+    if background > 0.005 {
+        println!("  {:<LW$}  {:>VW$}   ({})", "  Background", money(background), bg_note);
+    }
+    if adjustment.abs() > 0.005 {
+        let sign = if adjustment >= 0.0 { "+" } else { "" };
+        println!("  {:<LW$}  {:>VW$}", "  Adjustment", format!("{}{:.2}", sign, adjustment));
+    }
+    println!("  {}", sep);
+    let gap_label = if gap >= 0.0 { "Gap (under-reported)" } else { "Gap (over-reported)" };
+    println!("  {:<LW$}  {:>VW$}   ({:.1}%)", gap_label, money(gap), pct(gap.abs()));
+    println!();
+
+    if !orphans.is_empty() {
+        println!("  Untracked logs on disk    {:>VW$}   ({} session{} missing from trakr)",
+            money(untracked_usd), orphans.len(), if orphans.len() == 1 { "" } else { "s" });
+        let show = orphans.len().min(10);
+        for (id, project, cost) in orphans.iter().take(show) {
+            let short_id = &id[..id.len().min(8)];
+            let proj = project.rsplit('/').next().unwrap_or(project);
+            let proj = &proj[..proj.len().min(28)];
+            println!("    {:<10} {:<28}  {:>8}", short_id, proj, money(*cost));
+        }
+        if orphans.len() > show {
+            println!("    … and {} more", orphans.len() - show);
+        }
+        println!("  → Run `trakr sync` to ingest these, then re-run `trakr audit`.");
+        println!();
+    }
+
+    println!("  {:<LW$}  {:>VW$}   ({:.1}%)", "Residual after ingest", money(residual), pct(residual.abs()));
+    println!();
+
+    // ── Explain the residual: per-model split to eyeball against claude.ai ──
+    // The residual is dominated by API calls trakr can't see in transcripts (title/summary
+    // generation, almost all Haiku) plus rate-card error. claude.ai breaks spend down by model,
+    // so showing trakr's own per-model split lets the user spot WHICH tier is short.
+    if residual.abs() > 0.50 {
+        let by_model = storage::get_monthly_spend_by_model(&year_month).unwrap_or_default();
+        if !by_model.is_empty() {
+            let model_total: f64 = by_model.iter().map(|(_, c)| c).sum();
+            println!("  Where the gap likely is — trakr's transcript spend by model");
+            println!("  (open claude.ai → Usage and compare the per-model split):");
+            println!("  {}", sep);
+            for (tier, cost) in by_model.iter().filter(|(_, c)| *c > 0.005) {
+                let share = if model_total > 0.0 { cost / model_total * 100.0 } else { 0.0 };
+                println!("    {:<10} {:>10}   {:>4.0}%", tier, money(*cost), share);
+            }
+            if residual > 0.005 {
+                println!("  → If claude.ai shows materially MORE Haiku than trakr does, the gap is");
+                println!("    background Haiku calls (title/summary) — invisible to transcripts and");
+                println!("    not separately measurable on enterprise accounts (see note below).");
+                println!("  → If a paid tier (Opus/Sonnet) is short, it's likely usage on another");
+                println!("    machine under the same account — trakr only sees THIS machine's logs.");
+            }
+            println!();
+        }
+    }
+
+    // ── Diagnostics: the causes trakr can actually check locally ──
+    println!("  Diagnostics");
+    println!("  {}", sep);
+    let coverage_ok = orphans.is_empty();
+    println!(
+        "    {:<22} {} logs on disk / {} tracked   {}",
+        "Coverage (this month)",
+        disk_in_month,
+        tracked_ids.len(),
+        if coverage_ok { "✓" } else { "← untracked logs above" },
+    );
+    println!("    {:<22} {}", "Background", "flat estimate, not measured");
+    match rates::last_fetched_at() {
+        Some(ts) => {
+            let age_h = (Utc::now() - ts).num_hours();
+            let stale = if age_h > 48 { "  (stale — run `trakr sync-rates`)" } else { "" };
+            println!("    {:<22} {}h ago{}", "Rate card synced", age_h, stale);
+        }
+        None => println!("    {:<22} {}", "Rate card synced", "never — using hardcoded fallback"),
+    }
+    println!();
+
+    // Note: background API calls (title/summary generation, mostly Haiku) are billed by
+    // Anthropic but never written to local transcripts. Capturing them would require OTEL,
+    // which is unavailable on enterprise accounts, so trakr can only estimate them here.
+    println!("  Note: background API calls (title/summary generation, mostly Haiku) are billed");
+    println!("  by Anthropic but never appear in local transcripts. Capturing them would need");
+    println!("  OTEL, which is unavailable on enterprise accounts — so the Background figure");
+    println!("  above is a flat estimate, not a measured value.");
+    println!();
+
+    // ── Offer to record a reconciling adjustment ──
+    if untracked_usd > 1.0 {
+        // The honest fix for orphan logs is ingestion, not a fudge — don't offer to paper over it.
+        println!("Skipping adjustment: ingest the untracked logs with `trakr sync` first,");
+        println!("then re-run `trakr audit {:.2} --month {}` to reconcile the remainder.", actual, year_month);
+        return Ok(());
+    }
+
+    if residual.abs() <= 0.50 {
+        println!("Within $0.50 — no adjustment needed.");
+        return Ok(());
+    }
+
+    // Attribute the adjustment to the audited month: today if current, else month-end.
+    let current_ym = Utc::now().format("%Y-%m").to_string();
+    let adj_day = if year_month == current_ym {
+        Utc::now().format("%Y-%m-%d").to_string()
+    } else {
+        let (y, m): (i32, u32) = {
+            let mut parts = year_month.split('-');
+            (
+                parts.next().unwrap().parse().unwrap(),
+                parts.next().unwrap().parse().unwrap(),
+            )
+        };
+        let (ny, nm) = if m == 12 { (y + 1, 1) } else { (y, m + 1) };
+        let last = chrono::NaiveDate::from_ymd_opt(ny, nm, 1)
+            .and_then(|d| d.pred_opt())
+            .ok_or_else(|| anyhow::anyhow!("computing month-end for {}", year_month))?;
+        last.format("%Y-%m-%d").to_string()
+    };
+
+    let sign = if residual >= 0.0 { "+" } else { "" };
+    if !yes {
+        print!(
+            "Record a {}{:.2} adjustment on {} to reconcile with claude.ai? [y/N] ",
+            sign, residual, adj_day
+        );
+        std::io::stdout().flush().ok();
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer).ok();
+        if !matches!(answer.trim().to_lowercase().as_str(), "y" | "yes") {
+            println!("No adjustment recorded.");
+            println!("To record it later: trakr adjust {} {:.2} --reason \"audit vs claude.ai\"", adj_day, residual);
+            return Ok(());
+        }
+    }
+
+    let reason = format!("audit reconciliation vs claude.ai ${:.2} ({})", actual, year_month);
+    cmd_adjust(&adj_day, residual, Some(reason))?;
     Ok(())
 }
 
